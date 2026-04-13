@@ -15,6 +15,7 @@ plugins {
 }
 
 android {
+    enableKotlin = false
     namespace = "io.github.vvb2060.callrecording"
     defaultConfig {
         versionCode = 3
@@ -56,17 +57,14 @@ android {
 }
 
 dependencies {
-    compileOnly("androidx.annotation", "annotation", "1.3.0")
-    compileOnly("de.robv.android.xposed", "api", "82")
+    compileOnly("androidx.annotation:annotation:1.3.0")
+    compileOnly("de.robv.android.xposed:api:82")
 }
 
 val optimizeReleaseRes by tasks.registering(Exec::class) {
-    val aapt2 = Paths.get(
-        project.android.sdkDirectory.path,
-        "build-tools", project.android.buildToolsVersion, "aapt2"
-    )
+    val aapt2 = project.androidComponents.sdkComponents.aapt2.get().executable.get().toString()
     val zip = Paths.get(
-        project.buildDir.path, "intermediates",
+        project.layout.buildDirectory.get().toString(), "intermediates",
         "optimized_processed_res", "release", "optimizeReleaseResources",
         "resources-release-optimize.ap_"
     )
@@ -88,7 +86,7 @@ val delMetadata by tasks.registering {
     val files = tasks.named("packageRelease").get().outputs.files
     doLast {
         val options = ZFileOptions().apply {
-            alignmentRule = AlignmentRules.constantForSuffix(".so", 4096)
+            alignmentRule = AlignmentRules.constantForSuffix(".so", 16 * 1024)
             noTimestamps = true
             autoSortFiles = true
         }

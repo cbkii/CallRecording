@@ -11,9 +11,10 @@ pluginManagement {
         gradlePluginPortal()
     }
     plugins {
-        id("com.android.application") version "8.12.3"
-        id("com.android.library") version "8.12.3"
-        id("com.android.settings") version "8.12.3"
+        val agpVersion = "9.1.1"
+        id("com.android.application") version agpVersion
+        id("com.android.library") version agpVersion
+        id("com.android.settings") version agpVersion
     }
 }
 
@@ -23,10 +24,10 @@ plugins {
 
 android {
     minSdk = 28
-    targetSdk = 36
-    compileSdk = 36
+    targetSdk = 37
+    compileSdk = 37
     ndkVersion = "29.0.14206865"
-    buildToolsVersion = "36.1.0"
+    buildToolsVersion = "37.0.0"
 }
 
 dependencyResolutionManagement {
