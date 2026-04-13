@@ -15,8 +15,8 @@ import java.io.IOException;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -88,7 +88,71 @@ public class Init implements IXposedHookLoadPackage {
                 }
             });
         } else {
-            Log.e(TAG, "withinCrosbyGeoFence method not found");
+            Log.w(TAG, "withinCrosbyGeoFence method not found");
+        }
+    }
+
+    private static void hookGetSupportedLocaleFromCountryCode(DexHelper dex) {
+        var localeId = dex.encodeClassIndex(Locale.class);
+        var mapId = dex.encodeClassIndex(Map.class);
+        var stringId = dex.encodeClassIndex(String.class);
+        var getSupportedLocaleFromCountryCode = Arrays.stream(
+                        dex.findMethodUsingString("getSupportedLocaleFromCountryCode",
+                                false,
+                                localeId,
+                                (short) 2,
+                                null,
+                                -1,
+                                new long[]{mapId, stringId},
+                                null,
+                                null,
+                                true))
+                .mapToObj(dex::decodeMethodIndex)
+                .filter(Objects::nonNull)
+                .findFirst();
+        if (getSupportedLocaleFromCountryCode.isPresent()) {
+            var method = getSupportedLocaleFromCountryCode.get();
+            Log.d(TAG, "getSupportedLocaleFromCountryCode: " + method);
+            XposedBridge.hookMethod(method, new XC_MethodReplacement() {
+                @Override
+                protected Object replaceHookedMethod(MethodHookParam param) {
+                    Log.d(TAG, "getSupportedLocaleFromCountryCode: " + Arrays.toString(param.args) +
+                            " -> en_US");
+                    return Locale.US;
+                }
+            });
+        } else {
+            Log.e(TAG, "getSupportedLocaleFromCountryCode method not found");
+        }
+    }
+
+    private static void hookIsCallRecordingCountry(DexHelper dex) {
+        var isCallRecordingCountry = Arrays.stream(
+                        dex.findMethodUsingString("isCallRecordingCountry",
+                                false,
+                                -1,
+                                (short) 0,
+                                "Z",
+                                -1,
+                                null,
+                                null,
+                                null,
+                                true))
+                .mapToObj(dex::decodeMethodIndex)
+                .filter(Objects::nonNull)
+                .findFirst();
+        if (isCallRecordingCountry.isPresent()) {
+            var method = isCallRecordingCountry.get();
+            Log.d(TAG, "isCallRecordingCountry: " + method);
+            XposedBridge.hookMethod(method, new XC_MethodReplacement() {
+                @Override
+                protected Object replaceHookedMethod(MethodHookParam param) {
+                    Log.d(TAG, "isCallRecordingCountry: true");
+                    return true;
+                }
+            });
+        } else {
+            Log.e(TAG, "isCallRecordingCountry method not found");
         }
     }
 
@@ -186,12 +250,19 @@ public class Init implements IXposedHookLoadPackage {
     }
 
     private static void checkUnsupportedVersion(Context context) {
+        if (context.checkSelfPermission(android.Manifest.permission.CAPTURE_AUDIO_OUTPUT)
+                != PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(context, "CallRecording: Missing CAPTURE_AUDIO_OUTPUT permission, " +
+                    "what are you doing?", Toast.LENGTH_LONG).show();
+            Log.w(TAG, "Missing CAPTURE_AUDIO_OUTPUT permission");
+            return;
+        }
         try {
             var pm = context.getPackageManager();
             var info = pm.getPackageInfo(context.getPackageName(), 0);
             var versionName = info.versionName;
             if (versionName != null && versionName.endsWith("downloadable")) {
-                Toast.makeText(context, "CallRecording: Unsupported version, "+
+                Toast.makeText(context, "CallRecording: Unsupported version, " +
                         "please use full version.", Toast.LENGTH_LONG).show();
                 Log.w(TAG, "Unsupported version detected: " + versionName);
             }
@@ -207,6 +278,8 @@ public class Init implements IXposedHookLoadPackage {
             try (var dex = new DexHelper(lpparam.classLoader)) {
                 hookCanRecordCall(dex);
                 hookWithinCrosbyGeoFence(dex);
+                hookGetSupportedLocaleFromCountryCode(dex);
+                hookIsCallRecordingCountry(dex);
             }
             hookSynthesizeToFile();
             hookDispatchOnInit();
