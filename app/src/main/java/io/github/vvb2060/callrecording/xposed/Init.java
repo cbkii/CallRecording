@@ -85,12 +85,15 @@ public class Init implements IXposedHookLoadPackage {
     /** Locale used when FORCE_US_RECORDING_LOCALE is true. */
     private static final Locale FORCED_RECORDING_LOCALE = Locale.US;
 
+    /** en-AU locale constant; also used as the first entry in RECORDING_LOCALE_FALLBACKS. */
+    private static final Locale EN_AU = Locale.forLanguageTag("en-AU");
+
     /**
      * Fallback locale chain tried in order when the original Dialer locale is null/unsupported
      * and FORCE_US_RECORDING_LOCALE is false.
      */
     private static final Locale[] RECORDING_LOCALE_FALLBACKS = new Locale[]{
-            Locale.forLanguageTag("en-AU"),
+            EN_AU,
             Locale.US,
             Locale.ENGLISH
     };
@@ -101,6 +104,9 @@ public class Init implements IXposedHookLoadPackage {
 
     private static volatile boolean conservativeMode = false;
     private static final List<String> conservativeReasons = new ArrayList<>();
+
+    // Once-only guard for the deferred conservative environment check run from onResume
+    private static volatile boolean ranEnvCheck = false;
 
     // Once-only warning flags to avoid Toast spam
     private static volatile boolean warnedMissingPermission = false;
@@ -247,11 +253,7 @@ public class Init implements IXposedHookLoadPackage {
         }
         try {
             Locale def = Locale.getDefault();
-            if (def != null
-                    && def.getLanguage() != null
-                    && !def.getLanguage().isEmpty()
-                    && ("en".equalsIgnoreCase(def.getLanguage())
-                    || "AU".equalsIgnoreCase(def.getCountry()))) {
+            if (def != null && "en".equalsIgnoreCase(def.getLanguage())) {
                 return def;
             }
         } catch (Throwable t) {
@@ -271,6 +273,10 @@ public class Init implements IXposedHookLoadPackage {
 
     private static boolean shouldForceAvailabilityDespiteOriginalThrowable(String label,
             Throwable throwable) {
+        // Never swallow serious JVM errors or security exceptions — let those propagate.
+        if (throwable instanceof Error || throwable instanceof SecurityException) {
+            return false;
+        }
         // Only force recovery for the known call-recording eligibility hooks.
         // Never swallow arbitrary Dialer crashes outside this path.
         return "canRecordCall".equals(label)
@@ -475,9 +481,10 @@ public class Init implements IXposedHookLoadPackage {
                     if (ENABLE_VERBOSE_LOGGING) {
                         Log.d(TAG, "dispatchOnInit: args=" + Arrays.toString(param.args));
                     }
-                    // Only intercept failed-init path after the original has a chance to run.
-                    // We use beforeHookedMethod here solely for logging; the actual override
-                    // is only applied when conservative/safe mode confirms this is safe.
+                    // Intercept TTS init failures before the listener is notified.
+                    // Mutates args[0] to SUCCESS so Dialer treats TTS as initialised
+                    // even when the engine reported an error.
+                    // Guarded by conservativeMode to avoid overriding in spoofed environments.
                     if (!conservativeMode
                             && ENABLE_PROMPT_TTS_HOOKS
                             && !Objects.equals(param.args[0], TextToSpeech.SUCCESS)) {
@@ -517,7 +524,7 @@ public class Init implements IXposedHookLoadPackage {
                             && (queried.equals(fallback)
                             || queried.equals(Locale.US)
                             || queried.equals(Locale.ENGLISH)
-                            || queried.equals(Locale.forLanguageTag("en-AU")));
+                            || queried.equals(EN_AU));
                     if (isRecordingLocale) {
                         param.setResult(TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE);
                         Log.w(TAG, "isLanguageAvailable: " + queried
@@ -595,6 +602,16 @@ public class Init implements IXposedHookLoadPackage {
                     try {
                         Context context = ((Activity) param.thisObject).getApplicationContext();
                         if (context == null) return;
+                        if (ENABLE_CONSERVATIVE_ENVIRONMENT_MODE && !ranEnvCheck) {
+                            ranEnvCheck = true;
+                            boolean risky = detectRiskySpoofedEnvironment(context);
+                            if (risky) {
+                                conservativeMode = true;
+                                Log.w(TAG, "conservative mode active due to inconsistent "
+                                        + "environment: " + conservativeReasons);
+                            }
+                            Log.w(TAG, "envCheck done conservativeMode=" + conservativeMode);
+                        }
                         checkUnsupportedVersion(context);
                     } catch (Throwable t) {
                         Log.w(TAG, "onResume check failed safely", t);

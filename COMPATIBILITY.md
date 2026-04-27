@@ -81,7 +81,7 @@ su -c '/data/adb/lspd/cli status --json'
 
 **Commands confirmed in source:**
 
-```
+```text
 vector-cli [--json]
   status
   modules
@@ -118,7 +118,7 @@ vector-cli [--json]
 Vector scope entries use `package_name/user_id`.  For a standard single-user device, the user ID
 is `0`.
 
-```
+```text
 com.google.android.dialer/0
 ```
 
@@ -172,13 +172,13 @@ echo "=== CallRecording scope ==="
 
 Required scope:
 
-```
+```text
 io.github.vvb2060.callrecording → com.google.android.dialer/0
 ```
 
 Do **not** scope to:
 
-```
+```text
 android
 system_server
 com.android.phone
@@ -336,18 +336,23 @@ When the module detects `SDK_INT >= 36`, the safe profile is active.
 
 Logcat marker:
 
-```
+```text
 CallRecording: Android 16 safe profile active
 ```
 
-Under the safe profile:
-- boolean availability overrides remain enabled as after-hooks;
-- country / geofence final result still forced `true`;
-- locale fallback is deterministic (not unconditional pre-original US);
-- prompt/TTS hooks run in staged mode;
-- `ENABLE_SILENT_PROMPT_FALLBACK` is `false` unless explicitly enabled;
-- extra logging is emitted;
-- defensive environment checks run at load time.
+The `safeProfile` flag in `handleLoadPackage` gates only the logcat marker above.
+All other behaviours listed below are controlled by their own compile-time constants in `Init.java`
+and apply on **every** Android version unless those constants are changed:
+
+| Behaviour | Controlling constant |
+|-----------|---------------------|
+| Boolean availability after-hooks | `MODE` |
+| Country / geofence result forced `true` | `MODE` |
+| Deterministic locale fallback | `FORCE_US_RECORDING_LOCALE` / `RECORDING_LOCALE_FALLBACKS` |
+| Prompt / TTS hooks | `ENABLE_PROMPT_TTS_HOOKS` |
+| Silent-prompt fallback | `ENABLE_SILENT_PROMPT_FALLBACK` (default `false`) |
+| Verbose logging | `ENABLE_VERBOSE_LOGGING` |
+| Defensive environment checks | `ENABLE_CONSERVATIVE_ENVIRONMENT_MODE` |
 
 The safe profile does **not** disable the module's main purpose.
 
@@ -356,12 +361,14 @@ The safe profile does **not** disable the module's main purpose.
 ## Conservative / defensive environment mode
 
 When `ENABLE_CONSERVATIVE_ENVIRONMENT_MODE = true` (default), the module checks for signs of a
-spoofed or inconsistent environment inside the Dialer process at load time and optionally at
-activity resume.  All checks are wrapped in `try/catch(Throwable)` and never crash Dialer.
+spoofed or inconsistent environment inside the Dialer process.  A lightweight locale check runs at
+load time; the full check (`detectRiskySpoofedEnvironment`) runs once on the first
+`Activity.onResume` when a `Context` is available.  All checks are wrapped in
+`try/catch(Throwable)` and never crash Dialer.
 
-Checks performed:
+Checks performed by `detectRiskySpoofedEnvironment`:
 - null / empty default locale;
-- `Build.MODEL` empty on a known-Pixel device;
+- `Build.MODEL` null or empty (only on Android 16+, gated by `ENABLE_ANDROID16_SAFE_PROFILE`);
 - `getNetworkOperator()` returning `00101`;
 - `getNetworkOperatorName()` returning `TestNetwork` / `Android`;
 - `getSimState()` reporting absent SIM while active subscriptions exist.
