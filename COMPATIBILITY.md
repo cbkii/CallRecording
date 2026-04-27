@@ -1,4 +1,4 @@
-# Compatibility Notes — Pixel 9a / Android 16
+# Compatibility Notes — Android 16
 
 ---
 
@@ -198,13 +198,12 @@ This fork is:
 - **Dialer-only scope** — `com.google.android.dialer` / no system or GMS scopes.
 - **Vector-compatible** — all hooks, param methods, and module metadata confirmed correct against
   Vector v2.0 (commit `b71c33d`).
-- **Pixel 9a / Android 16 safe-profile aware** — `isPixel9aAndroid16()` detects `tegu` + SDK 36
+- **Android 16 safe-profile aware** — `isAndroid16()` detects SDK >= 36
   and activates conservative staged behaviour.
 
 ---
 
-This document describes the safe-profile behaviour added for Pixel 9a (codename `tegu`) running
-Android 16, and explains the design rationale for every hook change in this fork.
+This document describes the safe-profile behaviour added for Android 16 (SDK 36+) and explains the design rationale for every hook change in this fork.
 
 ---
 
@@ -239,7 +238,7 @@ depend on.
 Access path on Pixel: **Phone app → Call Assist → Call Recording**
 
 **Call Notes** is a separate, AI-powered feature with its own availability rules.  It is **not**
-available on Pixel 9a (A-series), and this module makes no attempt to enable it.
+available on A-series Pixel devices, and this module makes no attempt to enable it.
 
 Recording **cannot** start:
 - before the call is answered,
@@ -331,14 +330,14 @@ private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = true;
 
 ---
 
-## Pixel 9a / Android 16 safe profile
+## Android 16 safe profile
 
-When the module detects `Build.DEVICE == "tegu"` and `SDK_INT >= 36`, the safe profile is active.
+When the module detects `SDK_INT >= 36`, the safe profile is active.
 
 Logcat marker:
 
 ```
-CallRecording: Pixel 9a Android 16 safe profile active
+CallRecording: Android 16 safe profile active
 ```
 
 Under the safe profile:

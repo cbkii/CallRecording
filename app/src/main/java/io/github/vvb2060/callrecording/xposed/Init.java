@@ -68,8 +68,8 @@ public class Init implements IXposedHookLoadPackage {
     /** Enable extra debug logging. */
     private static final boolean ENABLE_VERBOSE_LOGGING = true;
 
-    /** Enable Pixel 9a / Android 16 safe-profile behaviour when device is detected. */
-    private static final boolean ENABLE_PIXEL_ANDROID16_SAFE_PROFILE = true;
+    /** Enable Android 16+ safe-profile behaviour when the runtime API level is detected. */
+    private static final boolean ENABLE_ANDROID16_SAFE_PROFILE = true;
 
     /** Enable defensive environment inconsistency detection. */
     private static final boolean ENABLE_CONSERVATIVE_ENVIRONMENT_MODE = true;
@@ -120,9 +120,8 @@ public class Init implements IXposedHookLoadPackage {
     // Device / environment helpers
     // -------------------------------------------------------------------------
 
-    private static boolean isPixel9aAndroid16() {
-        return "tegu".equalsIgnoreCase(Build.DEVICE)
-                && Build.VERSION.SDK_INT >= 36;
+    private static boolean isAndroid16() {
+        return Build.VERSION.SDK_INT >= 36;
     }
 
     /**
@@ -143,12 +142,12 @@ public class Init implements IXposedHookLoadPackage {
             Log.w(TAG, "riskyEnv: locale check failed", t);
         }
 
-        // Check Build fields for known Pixel 9a profile when safe profile is enabled
+        // Check Build fields when the Android 16 safe profile is enabled
         try {
-            if (ENABLE_PIXEL_ANDROID16_SAFE_PROFILE && isPixel9aAndroid16()) {
+            if (ENABLE_ANDROID16_SAFE_PROFILE && isAndroid16()) {
                 String model = Build.MODEL;
                 if (model == null || model.isEmpty()) {
-                    conservativeReasons.add("empty Build.MODEL on tegu");
+                    conservativeReasons.add("empty Build.MODEL");
                     risky = true;
                 }
             }
@@ -655,7 +654,7 @@ public class Init implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!"com.google.android.dialer".equals(lpparam.packageName)) return;
 
-        boolean safeProfile = ENABLE_PIXEL_ANDROID16_SAFE_PROFILE && isPixel9aAndroid16();
+        boolean safeProfile = ENABLE_ANDROID16_SAFE_PROFILE && isAndroid16();
 
         Log.w(TAG, "handleLoadPackage: " + lpparam.packageName
                 + " process=" + lpparam.processName
@@ -669,7 +668,7 @@ public class Init implements IXposedHookLoadPackage {
                 + " forceUSLocale=" + FORCE_US_RECORDING_LOCALE);
 
         if (safeProfile) {
-            Log.w(TAG, "Pixel 9a Android 16 safe profile active");
+            Log.w(TAG, "Android 16 safe profile active");
         }
 
         // Environment consistency check runs synchronously so hook installation
