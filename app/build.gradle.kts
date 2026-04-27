@@ -14,9 +14,21 @@ plugins {
     id("com.android.application")
 }
 
+val ksPath: String = System.getenv("KEYSTORE_PATH") ?: ""
+
 android {
     enableKotlin = false
     namespace = "io.github.vvb2060.callrecording"
+    if (ksPath.isNotEmpty()) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(ksPath)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
     defaultConfig {
         versionCode = 4
         versionName = "1.3"
@@ -34,7 +46,7 @@ android {
             isShrinkResources = true
             vcsInfo.include = false
             proguardFiles("proguard-rules.pro")
-            signingConfig = signingConfigs["debug"]
+            signingConfig = if (ksPath.isNotEmpty()) signingConfigs["release"] else signingConfigs["debug"]
         }
     }
     compileOptions {
@@ -81,7 +93,7 @@ val optimizeReleaseRes by tasks.registering(Exec::class) {
 }
 
 val delMetadata by tasks.registering {
-    val sign = android.signingConfigs["debug"]
+    val sign = if (ksPath.isNotEmpty()) android.signingConfigs["release"]!! else android.signingConfigs["debug"]
     val minSdk = android.defaultConfig.minSdk!!
     val files = tasks.named("packageRelease").get().outputs.files
     doLast {
