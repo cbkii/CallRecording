@@ -1,5 +1,208 @@
 # Compatibility Notes — Pixel 9a / Android 16
 
+---
+
+## Vector / lspd compatibility note
+
+**Checked:** JingMatrix/Vector commit `b71c33d`, latest release **Vector v2.0 (build 3021,
+2026-03-22)**.
+
+### API compatibility — confirmed ✅
+
+Vector ships a complete `legacy/` module that implements the full `de.robv.android.xposed.*`
+namespace on top of LSPlant.  All APIs used by this module are confirmed present and correct:
+
+| API | Status |
+|-----|--------|
+| `IXposedHookLoadPackage` | ✅ confirmed — detected via `assets/xposed_init` |
+| `XC_LoadPackage.LoadPackageParam` | ✅ confirmed — populated by `LegacyDelegateImpl.onPackageLoaded` |
+| `XC_MethodHook` / `beforeHookedMethod` / `afterHookedMethod` | ✅ confirmed — `legacy/src/main/java/de/robv/android/xposed/XC_MethodHook.java` |
+| `XC_MethodReplacement` | ✅ confirmed (we do not use it in this fork) |
+| `XposedBridge.hookMethod` | ✅ confirmed — routes through `hook_bridge.cpp` |
+| `param.hasThrowable()` | ✅ confirmed — `throwable != null` check |
+| `param.getThrowable()` | ✅ confirmed — returns `throwable` field |
+| `param.setThrowable(Throwable)` | ✅ confirmed — sets `throwable`, **clears** `result` to `null`, sets `returnEarly=true` |
+| `param.getResult()` | ✅ confirmed — returns `result` field |
+| `param.setResult(Object)` | ✅ confirmed — sets `result`, **clears** `throwable` to `null`, sets `returnEarly=true` |
+
+**Critical ordering note for `setThrowable(null)` + `setResult(...)`:**
+
+`setThrowable(null)` clears both `throwable` and `result`.  Always call `setResult(Boolean.TRUE)`
+*after* `setThrowable(null)` to ensure the result is non-null.  This fork does this correctly.
+Alternatively, calling only `setResult(Boolean.TRUE)` is equivalent because `setResult` also clears
+the throwable — but the explicit two-call form in this fork is more readable.
+
+### Synchronous hook installation — confirmed safe ✅
+
+The legacy README does not restrict or warn against synchronous hook installation from
+`handleLoadPackage`.  Starting background threads from `handleLoadPackage` is also not restricted,
+but this fork removed the background thread anyway for determinism (see below).
+
+### Reflective hooks on framework classes — confirmed safe ✅
+
+No Vector documentation or source restricts reflective hooks on framework classes (`TextToSpeech`,
+`Activity`) from an app-scoped process.
+
+### Module metadata — confirmed sufficient ✅
+
+Vector reads `assets/xposed_init` for the Java entrypoint and the following `AndroidManifest.xml`
+metadata:
+
+- `xposeddescription` — used in the Vector manager UI
+- `xposedminversion` — used for `XSharedPreferences` path selection (> 92 triggers safe-zone)
+- `xposedscope` — used as the default scope hint
+
+No Vector-specific metadata field is required beyond these legacy fields.  The current
+`AndroidManifest.xml` is sufficient.
+
+### Debug builds — recommended ✅
+
+Vector's README explicitly states:
+
+> Debug builds are recommended for users encountering issues or performing troubleshooting.
+
+If you are diagnosing hook failures or crashes, install the **Debug** release of Vector
+(`Vector-v2.0-3021-Debug.zip`) rather than the Release build.
+
+### Vector CLI — confirmed commands ✅
+
+CLI source confirmed from `daemon/src/main/kotlin/.../Cli.kt`.  The CLI binary identifies as
+`vector-cli`.  All commands require root UID (`su -c`).
+
+The `--json` flag must come **before** the subcommand:
+
+```sh
+# Correct
+su -c '/data/adb/lspd/cli --json status'
+
+# Wrong
+su -c '/data/adb/lspd/cli status --json'
+```
+
+**Commands confirmed in source:**
+
+```
+vector-cli [--json]
+  status
+  modules
+    ls [-e | -d]
+    enable  <PKG> [...]
+    disable <PKG> [...]
+  scope
+    ls  <MODULE_PKG>
+    add <MODULE_PKG> <pkg/user_id> [...]
+    set <MODULE_PKG> <pkg/user_id> [...]
+    rm  <MODULE_PKG> <pkg/user_id> [...]
+  config
+    get <KEY>
+    set <KEY> <VALUE>
+  db
+    backup  <PATH>
+    restore <PATH>
+    reset  [--force | -f]
+  log
+    cat  [-v]
+    tail [-v]
+    clear [-v]
+```
+
+**Commands that do NOT exist — do not use:**
+
+- `modules list` (it is `modules ls`)
+- `scope get` (it is `scope ls`)
+- `scope list` (it is `scope ls`)
+- Any raw SQLite invocation against `/data/adb/lspd/config/modules_config.db`
+
+### Scope format — confirmed ✅
+
+Vector scope entries use `package_name/user_id`.  For a standard single-user device, the user ID
+is `0`.
+
+```
+com.google.android.dialer/0
+```
+
+### No incompatibilities found
+
+No part of the current fork contradicts Vector v2.0 API or documented behaviour.  The move from
+`XC_MethodReplacement` to `XC_MethodHook.afterHookedMethod` is Vector-safe because Vector's
+execution loop always runs the original method before `afterHookedMethod` unless `returnEarly` was
+set in `beforeHookedMethod`.
+
+---
+
+## Vector diagnostics quick reference
+
+```sh
+# --- Framework and module status ---
+su -c '/data/adb/lspd/cli --json status'
+su -c '/data/adb/lspd/cli --json modules ls'
+su -c '/data/adb/lspd/cli --json scope ls io.github.vvb2060.callrecording'
+
+# --- Set scope (first install / after reboot) ---
+su -c '/data/adb/lspd/cli --json scope set io.github.vvb2060.callrecording com.google.android.dialer/0'
+
+# --- Log inspection ---
+su -c '/data/adb/lspd/cli log cat -v | grep -i CallRecording'
+su -c '/data/adb/lspd/cli log tail -v'
+
+# --- Non-JSON equivalents ---
+su -c '/data/adb/lspd/cli status'
+su -c '/data/adb/lspd/cli modules ls'
+su -c '/data/adb/lspd/cli scope ls io.github.vvb2060.callrecording'
+```
+
+Full diagnostic bundle:
+
+```sh
+su -c '
+echo "=== Vector status ==="
+/data/adb/lspd/cli --json status 2>&1 || /data/adb/lspd/cli status 2>&1
+
+echo
+echo "=== Vector modules ==="
+/data/adb/lspd/cli --json modules ls 2>&1 || /data/adb/lspd/cli modules ls 2>&1
+
+echo
+echo "=== CallRecording scope ==="
+/data/adb/lspd/cli --json scope ls io.github.vvb2060.callrecording 2>&1 || \
+  /data/adb/lspd/cli scope ls io.github.vvb2060.callrecording 2>&1
+'
+```
+
+Required scope:
+
+```
+io.github.vvb2060.callrecording → com.google.android.dialer/0
+```
+
+Do **not** scope to:
+
+```
+android
+system_server
+com.android.phone
+com.android.server.telecom
+com.google.android.gms
+com.google.android.googlequicksearchbox
+```
+
+---
+
+## Final compatibility statement
+
+This fork is:
+
+- **Legacy Xposed API** — uses `de.robv.android.xposed.*` only; no `libxposed` migration.  This is
+  intentional: Vector confirms full legacy API consistency with original Xposed.
+- **Dialer-only scope** — `com.google.android.dialer` / no system or GMS scopes.
+- **Vector-compatible** — all hooks, param methods, and module metadata confirmed correct against
+  Vector v2.0 (commit `b71c33d`).
+- **Pixel 9a / Android 16 safe-profile aware** — `isPixel9aAndroid16()` detects `tegu` + SDK 36
+  and activates conservative staged behaviour.
+
+---
+
 This document describes the safe-profile behaviour added for Pixel 9a (codename `tegu`) running
 Android 16, and explains the design rationale for every hook change in this fork.
 
