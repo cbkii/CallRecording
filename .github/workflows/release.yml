@@ -416,7 +416,7 @@ jobs:
             fi
             AI_CONTENT="${AI_CONTENT:-}"
             if [ -n "$(printf '%s' "$AI_CONTENT" | tr -d '[:space:]')" ]; then
-              if printf '%s' "$AI_CONTENT" | grep -Eiq '(^|\b)(cannot|can'\''t|unable|sorry|i can'\''t|i cannot|insufficient|as an ai)($|\b)'; then
+              if printf '%s' "$AI_CONTENT" | grep -Eiq '^\s*(I )?(cannot|can'\''t|am unable|apologize|sorry,|as an ai)'; then
                 echo "::warning::AI rewrite returned refusal-like text; using deterministic fallback."
               else
                 printf '%s\n' "$AI_CONTENT" > "$AI_BODY_FILE"
