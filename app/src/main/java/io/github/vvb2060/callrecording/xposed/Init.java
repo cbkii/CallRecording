@@ -32,6 +32,8 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
+import io.github.vvb2060.callrecording.BuildConfig;
+
 public class Init implements IXposedHookLoadPackage {
     private static final String TAG = "CallRecording";
 
@@ -648,7 +650,7 @@ public class Init implements IXposedHookLoadPackage {
     private static void hookSpeak() {
         try {
             Method speak = TextToSpeech.class.getDeclaredMethod(
-                    "speak", CharSequence.class, int.class, Bundle.class);
+                    "speak", CharSequence.class, int.class, Bundle.class, String.class);
             XposedBridge.hookMethod(speak, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
@@ -704,7 +706,6 @@ public class Init implements IXposedHookLoadPackage {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (!ENABLE_SILENT_PROMPT_FALLBACK) return;
-                    if (!inCallRecordingContext()) return;
                     String name = (String) param.args[0];
                     if (name == null) return;
                     String lower = name.toLowerCase(Locale.ROOT);
@@ -716,6 +717,7 @@ public class Init implements IXposedHookLoadPackage {
                     if (!(lower.endsWith(".wav") || lower.endsWith(".ogg") || lower.endsWith(".mp3"))) {
                         return;
                     }
+                    if (!inCallRecordingContext()) return;
                     param.setResult(new ByteArrayInputStream(getSilentPromptWavBytes()));
                     Log.w(TAG, "AssetManager.open: replaced prompt audio with silent asset: " + name);
                 }

@@ -68,7 +68,7 @@ android {
 dependencies {
     compileOnly("androidx.annotation:annotation:1.3.0")
     compileOnly("de.robv.android.xposed:api:82")
-    compileOnly("io.github.libxposed:api:101.0.1")
+    compileOnly("io.github.libxposed:api:101.0.0")
 }
 
 val optimizeReleaseRes by tasks.registering(Exec::class) {
