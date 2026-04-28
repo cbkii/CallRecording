@@ -42,6 +42,8 @@ jobs:
       - name: Resolve release metadata
         id: meta
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -76,6 +78,7 @@ jobs:
           done
 
           RELEASE_NAME="${SAFE_NAME:-$TAG}"
+          APP_VERSION="${TAG#v}"
           APK_BASENAME="callrecording-${TAG}.apk"
           SHA256_NAME="${APK_BASENAME}.sha256"
 
@@ -86,6 +89,7 @@ jobs:
             echo "version_name=$VERSION_NAME"
             echo "version_code=$VERSION_CODE"
             echo "tag=$TAG"
+            echo "app_version=$APP_VERSION"
             echo "release_name=$RELEASE_NAME"
             echo "apk_basename=$APK_BASENAME"
             echo "sha256_name=$SHA256_NAME"
@@ -95,8 +99,38 @@ jobs:
           echo "Resolved versionName: $VERSION_NAME"
           echo "Resolved versionCode: $VERSION_CODE"
           echo "Release tag: $TAG"
+          echo "Release app version: $APP_VERSION"
           echo "Release title: $RELEASE_NAME"
           echo "Previous release tag: ${PREV_TAG:-<none>}"
+
+      - name: Apply resolved release version to codebase
+        id: sync_version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_VERSION='${{ steps.meta.outputs.app_version }}'
+          CURRENT_VERSION="$(sed -n 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
+
+          [ -n "$TARGET_VERSION" ] || { echo "::error::Resolved app version is empty"; exit 1; }
+          [ -n "$CURRENT_VERSION" ] || { echo "::error::Could not parse current versionName from app/build.gradle.kts"; exit 1; }
+
+          if [ "$CURRENT_VERSION" != "$TARGET_VERSION" ]; then
+            sed -i "s/^\([[:space:]]*versionName[[:space:]]*=[[:space:]]*\)\"[^\"]*\"/\1\"${TARGET_VERSION}\"/" app/build.gradle.kts
+            echo "Updated app/build.gradle.kts versionName from $CURRENT_VERSION to $TARGET_VERSION"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add app/build.gradle.kts
+            git commit -m "chore: align app versionName with release tag ${{ steps.meta.outputs.tag }} [skip ci]"
+            git push origin "HEAD:${{ github.ref_name }}"
+          else
+            echo "app/build.gradle.kts already uses versionName=$TARGET_VERSION"
+          fi
+
+          RELEASE_SHA="$(git rev-parse HEAD)"
+          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Release commit SHA: $RELEASE_SHA"
 
       - name: Validate signing secrets
         shell: bash
@@ -205,19 +239,57 @@ jobs:
       - name: Generate release notes
         id: notes
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           TAG='${{ steps.meta.outputs.tag }}'
           PREV_TAG='${{ steps.meta.outputs.prev_tag }}'
+          RELEASE_SHA='${{ steps.sync_version.outputs.release_sha }}'
           REPO_URL='${{ github.server_url }}/${{ github.repository }}'
           NOTES_FILE=/tmp/release-notes.md
 
-          if [ -n "$PREV_TAG" ]; then
-            printf '**Full Changelog**: %s/compare/%s...%s\n' \
-              "$REPO_URL" "$PREV_TAG" "$TAG" > "$NOTES_FILE"
+          if [ -z "$PREV_TAG" ]; then
+            printf '👀 See README\n' > "$NOTES_FILE"
           else
-            printf 'Initial release.\n' > "$NOTES_FILE"
+            COMPARE_URL="$REPO_URL/compare/$PREV_TAG...$TAG"
+
+            mapfile -t COMMITS < <(git log --no-merges --pretty=format:'%H%x09%s' "${PREV_TAG}..${RELEASE_SHA}")
+
+            declare -A SEEN=()
+            declare -a ITEMS=()
+
+            for COMMIT in "${COMMITS[@]}"; do
+              SHA="${COMMIT%%$'\t'*}"
+              SUBJECT="${COMMIT#*$'\t'}"
+
+              PR_TITLE="$(gh api \
+                -H 'Accept: application/vnd.github+json' \
+                "/repos/$GITHUB_REPOSITORY/commits/$SHA/pulls" \
+                --jq 'if length > 0 then "\(.[0].title) (#\(.[0].number))" else "" end' 2>/dev/null || true)"
+
+              ENTRY="${PR_TITLE:-$SUBJECT}"
+              ENTRY="$(printf '%s' "$ENTRY" | tr -s ' ')"
+              [ -n "$ENTRY" ] || continue
+
+              if [ -z "${SEEN[$ENTRY]+x}" ]; then
+                ITEMS+=("$ENTRY")
+                SEEN["$ENTRY"]=1
+              fi
+            done
+
+            {
+              printf '### Changes since %s\n' "$PREV_TAG"
+              if [ "${#ITEMS[@]}" -eq 0 ]; then
+                printf -- '- No consolidated changes found.\n'
+              else
+                for ENTRY in "${ITEMS[@]}"; do
+                  printf -- '- %s\n' "$ENTRY"
+                done
+              fi
+              printf '\n**Full Changelog**: %s\n' "$COMPARE_URL"
+            } > "$NOTES_FILE"
           fi
 
           echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
@@ -236,22 +308,24 @@ jobs:
         run: |
           set -euo pipefail
           TAG='${{ steps.meta.outputs.tag }}'
+          TARGET_SHA='${{ steps.sync_version.outputs.release_sha }}'
 
           if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
             existing_tag_sha="$(git rev-list -n1 "refs/tags/$TAG")"
-            if [ "$existing_tag_sha" = "$GITHUB_SHA" ]; then
-              echo "Tag $TAG already exists and points at the current commit ($GITHUB_SHA); leaving it unchanged."
+            if [ "$existing_tag_sha" = "$TARGET_SHA" ]; then
+              echo "Tag $TAG already exists and points at the release commit ($TARGET_SHA); leaving it unchanged."
             else
-              echo "::error::Tag $TAG already exists but points at commit $existing_tag_sha, not the current commit $GITHUB_SHA"
+              echo "::error::Tag $TAG already exists but points at commit $existing_tag_sha, not the release commit $TARGET_SHA"
               exit 1
             fi
           else
-            git tag "$TAG" "$GITHUB_SHA"
+            git tag "$TAG" "$TARGET_SHA"
             git push origin "refs/tags/$TAG"
-            echo "Created and pushed tag $TAG"
+            echo "Created and pushed tag $TAG for commit $TARGET_SHA"
           fi
 
       - name: Publish GitHub release
+        id: publish
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
@@ -264,29 +338,12 @@ jobs:
           prerelease: ${{ inputs.prerelease }}
           fail_on_unmatched_files: true
 
-      - name: Sync versionName and versionCode back to codebase
+      - name: Release summary
         shell: bash
         run: |
           set -euo pipefail
 
-          TAG='${{ steps.meta.outputs.tag }}'
-
-          VERSION_STRING="${TAG#v}"
-
-          CURRENT_CODE="$(sed -n 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' app/build.gradle.kts | head -n 1)"
-          NEW_CODE="$((CURRENT_CODE + 1))"
-
-          sed -i "s/^\([[:space:]]*versionName[[:space:]]*=[[:space:]]*\)\"[^\"]*\"/\1\"${VERSION_STRING}\"/" app/build.gradle.kts
-          sed -i "s/^\([[:space:]]*versionCode[[:space:]]*=[[:space:]]*\)[0-9][0-9]*/\1${NEW_CODE}/" app/build.gradle.kts
-
-          echo "Updated versionName to: $VERSION_STRING"
-          echo "Updated versionCode to: $NEW_CODE"
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add app/build.gradle.kts
-          git commit -m "chore: bump versionName to ${TAG} and versionCode to ${NEW_CODE} after release [skip ci]"
-          git push origin "HEAD:${{ github.ref_name }}"
-
-          echo "Pushed version bump commit to ${{ github.ref_name }}"
+          RELEASE_URL='${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.meta.outputs.tag }}'
+          SUMMARY_LINE="Release ${{ steps.meta.outputs.tag }} published: $RELEASE_URL"
+          echo "$SUMMARY_LINE"
+          echo "$SUMMARY_LINE" >> "$GITHUB_STEP_SUMMARY"
