@@ -92,18 +92,21 @@ public class Init implements IXposedHookLoadPackage {
     /** Locale used when FORCE_US_RECORDING_LOCALE is true. */
     private static final Locale FORCED_RECORDING_LOCALE = Locale.US;
 
-    /** en-AU locale constant; also used as the first entry in RECORDING_LOCALE_FALLBACKS. */
+    /** en-AU locale constant used by TTS compatibility checks. */
     private static final Locale EN_AU = Locale.forLanguageTag("en-AU");
 
     /**
-     * Fallback locale chain tried in order when the original Dialer locale is null/unsupported
-     * and FORCE_US_RECORDING_LOCALE is false.
+     * Countries where Dialer call recording is considered unsupported for locale selection.
+     * When the reported country code is in this list, we fall back to a supported locale.
      */
-    private static final Locale[] RECORDING_LOCALE_FALLBACKS = new Locale[]{
-            EN_AU,
-            Locale.US,
-            Locale.ENGLISH
-    };
+    private static final java.util.Set<String> UNSUPPORTED_RECORDING_COUNTRY_CODES =
+            java.util.Set.of(
+                    "AE", "AT", "AZ", "BD", "BE", "BG", "BH", "CH", "CI", "CM", "CO",
+                    "CY", "CZ", "DE", "DK", "EE", "EG", "ES", "FI", "FR", "GH", "GR", "HR",
+                    "HU", "ID", "IE", "IQ", "IR", "IT", "JO", "KW", "LB", "LT", "LU", "LV",
+                    "MA", "MT", "MY", "MZ", "NG", "NL", "NP", "OM", "PA", "PH", "PK", "PL",
+                    "PT", "PY", "QA", "RO", "RU", "RW", "SA", "SE", "SI", "SK", "SN", "TN",
+                    "TR", "UA", "VN", "YE", "ZA", "ZW");
 
     // -------------------------------------------------------------------------
     // Runtime state
@@ -261,20 +264,21 @@ public class Init implements IXposedHookLoadPackage {
         if (FORCE_US_RECORDING_LOCALE) {
             return FORCED_RECORDING_LOCALE;
         }
-        try {
-            Locale def = Locale.getDefault();
-            if (def != null && "en".equalsIgnoreCase(def.getLanguage())) {
-                return def;
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "safeRecordingFallbackLocale: getDefault failed", t);
-        }
-        for (Locale locale : RECORDING_LOCALE_FALLBACKS) {
-            if (locale != null && locale.getLanguage() != null && !locale.getLanguage().isEmpty()) {
-                return locale;
-            }
-        }
+        // Compatibility fallback for null/unsupported country/locale paths.
         return Locale.US;
+    }
+
+    private static boolean isUnsupportedRecordingCountryCode(String countryCode) {
+        if (countryCode == null) return true;
+        String normalized = countryCode.trim().toUpperCase(Locale.ROOT);
+        if (normalized.isEmpty()) return true;
+        return UNSUPPORTED_RECORDING_COUNTRY_CODES.contains(normalized);
+    }
+
+    private static String extractCountryCodeArg(Object[] args) {
+        if (args == null || args.length < 2) return null;
+        Object arg = args[1];
+        return arg instanceof String ? (String) arg : null;
     }
 
     private static byte[] getSilentPromptWavBytes() {
@@ -474,9 +478,12 @@ public class Init implements IXposedHookLoadPackage {
                     }
 
                     Object original = param.getResult();
+                    String countryCode = extractCountryCodeArg(param.args);
+                    boolean unsupportedCountry = isUnsupportedRecordingCountryCode(countryCode);
                     if (ENABLE_VERBOSE_LOGGING) {
                         Log.d(TAG, "getSupportedLocaleFromCountryCode args="
-                                + Arrays.toString(param.args) + " original=" + original);
+                                + Arrays.toString(param.args) + " original=" + original
+                                + " unsupportedCountry=" + unsupportedCountry);
                     }
 
                     if (FORCE_US_RECORDING_LOCALE) {
@@ -487,15 +494,17 @@ public class Init implements IXposedHookLoadPackage {
                         return;
                     }
 
-                    if (original instanceof Locale) {
-                        // Preserve Dialer's own successful locale
-                        Log.d(TAG, "getSupportedLocaleFromCountryCode: locale original="
-                                + original + " final=" + original + " (preserved)");
+                    if (!unsupportedCountry && original instanceof Locale) {
+                        // Preserve Dialer's own successful locale only when country is supported.
+                        Log.d(TAG, "getSupportedLocaleFromCountryCode: country=" + countryCode
+                                + " locale original=" + original + " final=" + original
+                                + " (preserved)");
                         return;
                     }
 
-                    Log.w(TAG, "getSupportedLocaleFromCountryCode: locale original="
-                            + original + " (null/unsupported) final=" + fallback);
+                    Log.w(TAG, "getSupportedLocaleFromCountryCode: country=" + countryCode
+                            + " locale original=" + original
+                            + " (null/unsupported country) final=" + fallback);
                     param.setResult(fallback);
                 }
             });

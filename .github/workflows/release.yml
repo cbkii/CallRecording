@@ -198,7 +198,8 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build signed release APK
+      - name: Build signed release APK variants
+        id: build_apks
         shell: bash
         env:
           KEYSTORE_PATH: /tmp/release.keystore
@@ -207,38 +208,113 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon clean assembleRelease
+          INIT_FILE="app/src/main/java/io/github/vvb2060/callrecording/xposed/Init.java"
+          INIT_BACKUP="/tmp/Init.java.release.bak"
+          cp "$INIT_FILE" "$INIT_BACKUP"
+
+          restore_init() {
+            cp "$INIT_BACKUP" "$INIT_FILE"
+          }
+          trap restore_init EXIT
+
+          variant_suffix() {
+            case "$1" in
+              FORCE_LEGACY_US) echo "force-US" ;;
+              OBSERVE_ONLY) echo "observe" ;;
+              *) echo "::error::Unknown compatibility mode: $1" >&2; exit 1 ;;
+            esac
+          }
+
+          build_mode_apk() {
+            local mode="$1"
+            local output_name="$2"
+            python - "$mode" "$INIT_FILE" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+mode = sys.argv[1]
+path = Path(sys.argv[2])
+source = path.read_text()
+
+source = re.sub(
+    r'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode\.[A-Z_]+;',
+    f'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode.{mode};',
+    source,
+    count=1,
+)
+
+# Primary release must keep all silent-mode features enabled.
+if mode == "SAFE_GLOBAL_ENABLE":
+    source = re.sub(
+        r'private static final boolean ENABLE_PROMPT_TTS_HOOKS = (true|false);',
+        'private static final boolean ENABLE_PROMPT_TTS_HOOKS = true;',
+        source,
+        count=1,
+    )
+    source = re.sub(
+        r'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = (true|false);',
+        'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = true;',
+        source,
+        count=1,
+    )
+
+path.write_text(source)
+PY
+
+            ./gradlew --no-daemon assembleRelease
+            APK_PATH="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' | sort | head -n 1)"
+            [ -n "$APK_PATH" ] || { echo "::error::No release APK found under app/build/outputs/apk/release"; exit 1; }
+            cp "$APK_PATH" "$output_name"
+            sha256sum "$output_name" > "${output_name}.sha256"
+            cp "$INIT_BACKUP" "$INIT_FILE"
+          }
+
+          ./gradlew --no-daemon clean
+
+          PRIMARY_APK='${{ steps.meta.outputs.apk_basename }}'
+          build_mode_apk "SAFE_GLOBAL_ENABLE" "$PRIMARY_APK"
+
+          VARIANT_FILES=("$PRIMARY_APK" "${PRIMARY_APK}.sha256")
+          for mode in FORCE_LEGACY_US OBSERVE_ONLY; do
+            MODE_SUFFIX="$(variant_suffix "$mode")"
+            APK_NAME="callrecording-${{ steps.meta.outputs.tag }}-${MODE_SUFFIX}.apk"
+            build_mode_apk "$mode" "$APK_NAME"
+            VARIANT_FILES+=("$APK_NAME" "${APK_NAME}.sha256")
+          done
+
+          {
+            echo "release_apk=$PRIMARY_APK"
+            echo "release_sha256=${PRIMARY_APK}.sha256"
+            echo "release_files<<EOF"
+            for f in "${VARIANT_FILES[@]}"; do
+              echo "$f"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Inspect and validate built APK
-        id: apk
         shell: bash
         run: |
           set -euo pipefail
 
-          APK_PATH="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' | sort | head -n 1)"
-          [ -n "$APK_PATH" ] || { echo "::error::No release APK found under app/build/outputs/apk/release"; exit 1; }
-
-          echo "Built APK: $APK_PATH"
-
-          if unzip -p "$APK_PATH" assets/xposed_init > /dev/null 2>&1; then
-            echo "Detected legacy Xposed packaging"
-            unzip -p "$APK_PATH" assets/xposed_init | grep -qx 'io.github.vvb2060.callrecording.xposed.Init' || {
-              echo "::error::assets/xposed_init does not contain io.github.vvb2060.callrecording.xposed.Init"
-              exit 1
-            }
-          else
-            echo "::error::APK does not contain expected Xposed entry point (assets/xposed_init)"
-            exit 1
-          fi
-
-          cp "$APK_PATH" "${{ steps.meta.outputs.apk_basename }}"
-          sha256sum "${{ steps.meta.outputs.apk_basename }}" > "${{ steps.meta.outputs.sha256_name }}"
-
-          {
-            echo "apk_path=$APK_PATH"
-            echo "release_apk=${{ steps.meta.outputs.apk_basename }}"
-            echo "release_sha256=${{ steps.meta.outputs.sha256_name }}"
-          } >> "$GITHUB_OUTPUT"
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            case "$file" in
+              *.apk)
+                echo "Validating APK: $file"
+                if unzip -p "$file" assets/xposed_init > /dev/null 2>&1; then
+                  unzip -p "$file" assets/xposed_init | grep -qx 'io.github.vvb2060.callrecording.xposed.Init' || {
+                    echo "::error::$file: assets/xposed_init does not contain io.github.vvb2060.callrecording.xposed.Init"
+                    exit 1
+                  }
+                else
+                  echo "::error::$file does not contain expected Xposed entry point (assets/xposed_init)"
+                  exit 1
+                fi
+                ;;
+            esac
+          done <<< "${{ steps.build_apks.outputs.release_files }}"
 
       - name: Generate release notes
         id: notes
@@ -446,9 +522,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-apk-${{ steps.meta.outputs.tag }}
-          path: |
-            ${{ steps.apk.outputs.release_apk }}
-            ${{ steps.apk.outputs.release_sha256 }}
+          path: ${{ steps.build_apks.outputs.release_files }}
           if-no-files-found: error
 
       - name: Create or update git tag
@@ -479,9 +553,7 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.release_name }}
           body_path: ${{ steps.notes.outputs.notes_file }}
-          files: |
-            ${{ steps.apk.outputs.release_apk }}
-            ${{ steps.apk.outputs.release_sha256 }}
+          files: ${{ steps.build_apks.outputs.release_files }}
           draft: ${{ inputs.draft }}
           prerelease: ${{ inputs.prerelease }}
           fail_on_unmatched_files: true
