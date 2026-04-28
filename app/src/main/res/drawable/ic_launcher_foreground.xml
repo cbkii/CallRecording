@@ -8,7 +8,8 @@
     <group
         android:scaleX="0.075"
         android:scaleY="-0.075"
-        android:translateY="1254">
+        android:translateX="156.75"
+        android:translateY="1097.25">
 
         <!-- Phone handset icon -->
         <path
