@@ -58,6 +58,9 @@ android {
             path = file("src/main/jni/Android.mk")
         }
     }
+    buildFeatures {
+        buildConfig = true
+    }
     packaging {
         jniLibs {
             useLegacyPackaging = false

@@ -129,6 +129,7 @@ public class Init implements IXposedHookLoadPackage {
             0, 16, 0, 100, 97, 116, 97, 0, 0, 0, 0};
 
     private static volatile byte[] silentPromptWav;
+    private static volatile Field utteranceListenerField;
 
     // -------------------------------------------------------------------------
     // Device / environment helpers
@@ -658,25 +659,40 @@ public class Init implements IXposedHookLoadPackage {
                     if (!inCallRecordingContext()) return;
                     param.args[0] = "";
                     param.setResult(TextToSpeech.SUCCESS);
-                    Log.w(TAG, "speak(CharSequence,int,Bundle): silent fallback engaged");
+                    Log.w(TAG, "speak(CharSequence,int,Bundle,String): silent fallback engaged");
+                    // Fire onDone so callers waiting for utterance callbacks are not stalled.
+                    try {
+                        Field f = utteranceListenerField;
+                        if (f == null) {
+                            f = TextToSpeech.class.getDeclaredField("mUtteranceProgressListener");
+                            f.setAccessible(true);
+                            utteranceListenerField = f;
+                        }
+                        UtteranceProgressListener listener =
+                                (UtteranceProgressListener) f.get(param.thisObject);
+                        if (listener == null) return;
+                        listener.onDone((String) param.args[3]);
+                    } catch (ReflectiveOperationException e) {
+                        Log.e(TAG, "speak: cannot invoke onDone", e);
+                    }
                 }
             });
         } catch (NoSuchMethodException e) {
-            Log.w(TAG, "speak(CharSequence,int,Bundle) not found", e);
+            Log.w(TAG, "speak(CharSequence,int,Bundle,String) not found", e);
         }
     }
 
     private static void hookCallRecordingDisclosure(ClassLoader classLoader) {
         try {
-            XposedHelpers.findAndHookConstructor(
+            Class<?> disclosureClass = XposedHelpers.findClass(
                     "com.google.android.dialer.callcomposer.CallRecordingDisclosure",
-                    classLoader,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            setDisclosurePlayerSilent(param.thisObject);
-                        }
-                    });
+                    classLoader);
+            XposedBridge.hookAllConstructors(disclosureClass, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    setDisclosurePlayerSilent(param.thisObject);
+                }
+            });
             Log.w(TAG, "CallRecordingDisclosure constructor hook installed");
         } catch (Throwable t) {
             Log.w(TAG, "CallRecordingDisclosure constructor hook unavailable", t);
