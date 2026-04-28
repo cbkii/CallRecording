@@ -3,6 +3,7 @@ package io.github.vvb2060.callrecording.xposed;
 import android.app.Activity;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.content.res.AssetManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.speech.tts.TextToSpeech;
@@ -15,6 +16,8 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.ByteArrayInputStream;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -26,6 +29,7 @@ import java.util.Objects;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class Init implements IXposedHookLoadPackage {
@@ -63,7 +67,7 @@ public class Init implements IXposedHookLoadPackage {
      * When true, write built-in silent WAV when TTS synthesize fails.
      * Disabled by default to avoid creating inconsistent prompt/audio state.
      */
-    private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = false;
+    private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = true;
 
     /** Enable extra debug logging. */
     private static final boolean ENABLE_VERBOSE_LOGGING = true;
@@ -121,6 +125,8 @@ public class Init implements IXposedHookLoadPackage {
             69, 102, 109, 116, 32, 16, 0, 0, 0, 1, 0,
             1, 0, -128, 62, 0, 0, 0, 125, 0, 0, 2,
             0, 16, 0, 100, 97, 116, 97, 0, 0, 0, 0};
+
+    private static volatile byte[] silentPromptWav;
 
     // -------------------------------------------------------------------------
     // Device / environment helpers
@@ -265,6 +271,56 @@ public class Init implements IXposedHookLoadPackage {
             }
         }
         return Locale.US;
+    }
+
+    private static byte[] getSilentPromptWavBytes() {
+        if (silentPromptWav != null) {
+            return silentPromptWav;
+        }
+        synchronized (Init.class) {
+            if (silentPromptWav != null) {
+                return silentPromptWav;
+            }
+            String[] candidates = new String[]{
+                    "assets/silent_16k.wav",
+                    "/assets/silent_16k.wav",
+                    "silent_16k.wav"
+            };
+            for (String name : candidates) {
+                try (InputStream in = Init.class.getClassLoader().getResourceAsStream(name)) {
+                    if (in == null) continue;
+                    byte[] data = in.readAllBytes();
+                    if (data.length > 0) {
+                        silentPromptWav = data;
+                        Log.w(TAG, "Loaded silent prompt wav asset: " + name
+                                + " bytes=" + data.length);
+                        return silentPromptWav;
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "Failed reading silent wav asset: " + name, t);
+                }
+            }
+            silentPromptWav = wav;
+            Log.w(TAG, "Using built-in silent wav fallback bytes=" + wav.length);
+            return silentPromptWav;
+        }
+    }
+
+    private static boolean inCallRecordingContext() {
+        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+        for (StackTraceElement e : stack) {
+            String cls = e.getClassName();
+            if (cls == null) continue;
+            String lower = cls.toLowerCase(Locale.ROOT);
+            if (lower.contains("callrecord")
+                    || lower.contains("callassist")
+                    || lower.contains("callcomposer")
+                    || lower.contains("disclosure")
+                    || lower.contains("incall")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // -------------------------------------------------------------------------
@@ -561,10 +617,10 @@ public class Init implements IXposedHookLoadPackage {
                         return;
                     }
 
-                    Log.w(TAG, "synthesizeToFile: TTS failed, writing built-in silent wav");
+                    Log.w(TAG, "synthesizeToFile: TTS failed, writing silent wav fallback");
                     var file = (File) param.args[2];
                     try (var out = new FileOutputStream(file)) {
-                        out.write(wav);
+                        out.write(getSilentPromptWavBytes());
                         param.setResult(TextToSpeech.SUCCESS);
                     } catch (IOException e) {
                         Log.e(TAG, "synthesizeToFile: cannot write " + file, e);
@@ -586,6 +642,86 @@ public class Init implements IXposedHookLoadPackage {
             });
         } catch (NoSuchMethodException e) {
             Log.e(TAG, "synthesizeToFile method not found", e);
+        }
+    }
+
+    private static void hookSpeak() {
+        try {
+            Method speak = TextToSpeech.class.getDeclaredMethod(
+                    "speak", CharSequence.class, int.class, Bundle.class);
+            XposedBridge.hookMethod(speak, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!ENABLE_PROMPT_TTS_HOOKS || !ENABLE_SILENT_PROMPT_FALLBACK) return;
+                    if (!inCallRecordingContext()) return;
+                    param.args[0] = "";
+                    param.setResult(TextToSpeech.SUCCESS);
+                    Log.w(TAG, "speak(CharSequence,int,Bundle): silent fallback engaged");
+                }
+            });
+        } catch (NoSuchMethodException e) {
+            Log.w(TAG, "speak(CharSequence,int,Bundle) not found", e);
+        }
+    }
+
+    private static void hookCallRecordingDisclosure(ClassLoader classLoader) {
+        try {
+            XposedHelpers.findAndHookConstructor(
+                    "com.google.android.dialer.callcomposer.CallRecordingDisclosure",
+                    classLoader,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            setDisclosurePlayerSilent(param.thisObject);
+                        }
+                    });
+            Log.w(TAG, "CallRecordingDisclosure constructor hook installed");
+        } catch (Throwable t) {
+            Log.w(TAG, "CallRecordingDisclosure constructor hook unavailable", t);
+        }
+    }
+
+    private static void setDisclosurePlayerSilent(Object disclosure) {
+        if (!ENABLE_SILENT_PROMPT_FALLBACK || disclosure == null) return;
+        for (String fieldName : new String[]{"mMediaPlayer", "mediaPlayer", "player"}) {
+            try {
+                Object player = XposedHelpers.getObjectField(disclosure, fieldName);
+                if (player != null) {
+                    XposedHelpers.callMethod(player, "setVolume", 0f, 0f);
+                    Log.w(TAG, "Recording: Silent mode active (player muted via " + fieldName
+                            + ")");
+                    return;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void hookAssetManagerOpen() {
+        try {
+            Method open = AssetManager.class.getDeclaredMethod("open", String.class);
+            XposedBridge.hookMethod(open, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!ENABLE_SILENT_PROMPT_FALLBACK) return;
+                    if (!inCallRecordingContext()) return;
+                    String name = (String) param.args[0];
+                    if (name == null) return;
+                    String lower = name.toLowerCase(Locale.ROOT);
+                    if (!lower.contains("record")
+                            && !lower.contains("disclosure")
+                            && !lower.contains("announcement")) {
+                        return;
+                    }
+                    if (!(lower.endsWith(".wav") || lower.endsWith(".ogg") || lower.endsWith(".mp3"))) {
+                        return;
+                    }
+                    param.setResult(new ByteArrayInputStream(getSilentPromptWavBytes()));
+                    Log.w(TAG, "AssetManager.open: replaced prompt audio with silent asset: " + name);
+                }
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "AssetManager.open hook unavailable", t);
         }
     }
 
@@ -669,12 +805,19 @@ public class Init implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (!"com.google.android.dialer".equals(lpparam.packageName)) return;
+        handleDialerPackageLoad(lpparam.packageName, lpparam.processName, lpparam.classLoader);
+    }
+
+    static void handleDialerPackageLoad(String packageName, String processName, ClassLoader classLoader) {
+        if (!"com.google.android.dialer".equals(packageName)) return;
+        if (!BuildConfig.DEBUG && !ENABLE_SILENT_PROMPT_FALLBACK) {
+            throw new IllegalStateException("Release builds must keep ENABLE_SILENT_PROMPT_FALLBACK=true");
+        }
 
         boolean safeProfile = ENABLE_ANDROID16_SAFE_PROFILE && isAndroid16();
 
-        Log.w(TAG, "handleLoadPackage: " + lpparam.packageName
-                + " process=" + lpparam.processName
+        Log.w(TAG, "handleLoadPackage: " + packageName
+                + " process=" + processName
                 + " device=" + Build.DEVICE
                 + " model=" + Build.MODEL
                 + " sdk=" + Build.VERSION.SDK_INT
@@ -712,7 +855,7 @@ public class Init implements IXposedHookLoadPackage {
         Log.w(TAG, "conservativeMode=" + conservativeMode);
 
         // Hook installation is synchronous (no background thread) for determinism.
-        try (var dex = new DexHelper(lpparam.classLoader)) {
+        try (var dex = new DexHelper(classLoader)) {
             hookCanRecordCall(dex);
             hookWithinCrosbyGeoFence(dex);
             hookGetSupportedLocaleFromCountryCode(dex);
@@ -728,6 +871,11 @@ public class Init implements IXposedHookLoadPackage {
                 Log.e(TAG, "Failed to install synthesizeToFile hook", t);
             }
             try {
+                hookSpeak();
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to install speak hook", t);
+            }
+            try {
                 hookDispatchOnInit();
             } catch (Throwable t) {
                 Log.e(TAG, "Failed to install dispatchOnInit hook", t);
@@ -736,6 +884,16 @@ public class Init implements IXposedHookLoadPackage {
                 hookIsLanguageAvailable();
             } catch (Throwable t) {
                 Log.e(TAG, "Failed to install isLanguageAvailable hook", t);
+            }
+            try {
+                hookAssetManagerOpen();
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to install AssetManager.open hook", t);
+            }
+            try {
+                hookCallRecordingDisclosure(classLoader);
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to install CallRecordingDisclosure hook", t);
             }
         } else {
             Log.w(TAG, "Prompt/TTS hooks disabled by configuration");
