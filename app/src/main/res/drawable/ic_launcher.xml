@@ -10,9 +10,10 @@
         android:pathData="M0,0h1254v1254h-1254z" />
 
     <group
-        android:scaleX="0.1"
-        android:scaleY="-0.1"
-        android:translateY="1254">
+        android:scaleX="0.075"
+        android:scaleY="-0.075"
+        android:translateX="156.75"
+        android:translateY="1097.25">
 
         <path
             android:fillColor="#FFFFFF"
