@@ -32,6 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
+      models: read
 
     steps:
       - name: Check out source
@@ -82,8 +84,10 @@ jobs:
           APK_BASENAME="callrecording-${TAG}.apk"
           SHA256_NAME="${APK_BASENAME}.sha256"
 
-          PREV_TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 \
-            --json tagName --jq '.[0].tagName // ""' 2>/dev/null || echo "")"
+          PREV_TAG="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/$GITHUB_REPOSITORY/releases?per_page=50" \
+            --jq '[.[] | select(.draft == false) | .tag_name][0] // ""' 2>/dev/null || echo "")"
 
           {
             echo "version_name=$VERSION_NAME"
@@ -241,6 +245,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          AI_RELEASE_NOTES_MODEL: ${{ vars.AI_RELEASE_NOTES_MODEL || 'openai/gpt-4.1-mini' }}
         run: |
           set -euo pipefail
 
@@ -249,12 +255,16 @@ jobs:
           RELEASE_SHA='${{ steps.sync_version.outputs.release_sha }}'
           REPO_URL='${{ github.server_url }}/${{ github.repository }}'
           NOTES_FILE=/tmp/release-notes.md
+          BASE_NOTES_FILE=/tmp/release-notes-base.md
+          LOCAL_NOTES_FILE=/tmp/release-notes-local.md
+          CONTEXT_JSON=/tmp/release-context.json
+          CONTEXT_JSONL=/tmp/release-context.jsonl
+          REQUEST_JSON=/tmp/github-models-request.json
+          AI_RESPONSE_JSON=/tmp/github-models-response.json
+          AI_BODY_FILE=/tmp/release-notes-ai.md
 
-          if [ -z "$PREV_TAG" ]; then
-            printf '👀 See README\n' > "$NOTES_FILE"
-          else
-            COMPARE_URL="$REPO_URL/compare/$PREV_TAG...$TAG"
-
+          build_local_notes() {
+            local compare_url="$1"
             mapfile -t COMMITS < <(git log --no-merges --pretty=format:'%H%x09%s' "${PREV_TAG}..${RELEASE_SHA}")
 
             declare -A SEEN=()
@@ -288,10 +298,148 @@ jobs:
                   printf -- '- %s\n' "$ENTRY"
                 done
               fi
-              printf '\n**Full Changelog**: %s\n' "$COMPARE_URL"
+              printf '\n**Full Changelog**: %s\n' "$compare_url"
+            } > "$LOCAL_NOTES_FILE"
+          }
+
+          if [ -z "$PREV_TAG" ]; then
+            {
+              printf '### Initial release\n'
+              printf '\n'
+              printf 'This is the initial signed APK release for this project.\n'
+              printf 'See the README for installation and usage guidance.\n'
             } > "$NOTES_FILE"
+            echo "notes_mode=initial" >> "$GITHUB_OUTPUT"
+            echo "Release notes mode: initial"
+            echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          COMPARE_URL="$REPO_URL/compare/$PREV_TAG...$TAG"
+          NOTES_MODE="local-fallback"
+
+          build_local_notes "$COMPARE_URL"
+
+          GH_NOTES=""
+          if GH_NOTES="$(gh api -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" \
+            -f target_commitish="$RELEASE_SHA" \
+            -f previous_tag_name="$PREV_TAG" \
+            --jq '.body // ""' 2>/dev/null)"; then
+            if [ -n "$(printf '%s' "$GH_NOTES" | tr -d '[:space:]')" ]; then
+              printf '%s\n' "$GH_NOTES" > "$BASE_NOTES_FILE"
+              NOTES_MODE="github-generated"
+            else
+              echo "::warning::GitHub generated release notes were empty; falling back to local deterministic notes."
+              cp "$LOCAL_NOTES_FILE" "$BASE_NOTES_FILE"
+            fi
+          else
+            echo "::warning::GitHub generated release notes API failed; falling back to local deterministic notes."
+            cp "$LOCAL_NOTES_FILE" "$BASE_NOTES_FILE"
+          fi
+
+          : > "$CONTEXT_JSONL"
+          mapfile -t COMMITS < <(git log --no-merges --pretty=format:'%H%x09%s' "${PREV_TAG}..${RELEASE_SHA}")
+          for COMMIT in "${COMMITS[@]}"; do
+            SHA="${COMMIT%%$'\t'*}"
+            SUBJECT="${COMMIT#*$'\t'}"
+            SHORT_SHA="$(git rev-parse --short "$SHA")"
+
+            if PR_JSON="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "/repos/$GITHUB_REPOSITORY/commits/$SHA/pulls" 2>/dev/null || true)"; then
+              :
+            fi
+            PR_JSON="${PR_JSON:-[]}"
+
+            printf '%s' "$PR_JSON" | jq -c --arg sha "$SHA" --arg short_sha "$SHORT_SHA" --arg subject "$SUBJECT" '
+              (if (type == "array" and length > 0) then .[0] else null end) as $pr
+              | {
+                  sha: $sha,
+                  short_sha: $short_sha,
+                  subject: $subject,
+                  pr_number: ($pr.number // null),
+                  pr_title: ($pr.title // null),
+                  pr_body: (($pr.body // "")[0:3000]),
+                  pr_labels: (($pr.labels // []) | map(.name)),
+                  pr_author: ($pr.user.login // null)
+                }
+            ' >> "$CONTEXT_JSONL"
+          done
+
+          jq -s \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg tag "$TAG" \
+            --arg previous_tag "$PREV_TAG" \
+            --arg release_sha "$RELEASE_SHA" \
+            --arg compare_url "$COMPARE_URL" \
+            --rawfile github_generated_notes "$BASE_NOTES_FILE" '
+            {
+              repository: $repository,
+              tag: $tag,
+              previous_tag: $previous_tag,
+              release_sha: $release_sha,
+              compare_url: $compare_url,
+              github_generated_notes: $github_generated_notes,
+              changes: .
+            }
+          ' "$CONTEXT_JSONL" > "$CONTEXT_JSON"
+
+          USER_PROMPT="$(jq -cn --rawfile ctx "$CONTEXT_JSON" '
+            "Release context JSON:\n\($ctx)\n\nWrite concise plain-English GitHub release notes for an Android APK release.\nUse only supplied release context.\nDo not invent features, fixes, test results, compatibility, privacy, safety, integrity, or Play Store claims.\nConsolidate repeated commit/PR noise.\nPrefer user-visible changes over internal churn.\nMention build/release plumbing only if materially relevant to the artifact.\nOutput Markdown only.\nDo not include a Full Changelog link because the workflow appends one.\nKeep to one short summary paragraph plus 3-8 bullets unless there is very little to say."
+          ')"
+
+          jq -n \
+            --arg model "$AI_RELEASE_NOTES_MODEL" \
+            --arg system_msg "You are a careful release note editor. Produce concise factual markdown based only on provided context." \
+            --arg user_msg "$USER_PROMPT" '
+            {
+              model: $model,
+              temperature: 0.2,
+              messages: [
+                { role: "system", content: $system_msg },
+                { role: "user", content: $user_msg }
+              ]
+            }
+          ' > "$REQUEST_JSON"
+
+          AI_OK=0
+          if curl --silent --show-error --fail \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data @"$REQUEST_JSON" \
+            https://models.github.ai/inference/chat/completions > "$AI_RESPONSE_JSON" 2>/dev/null; then
+            if AI_CONTENT="$(jq -r '.choices[0].message.content // ""' "$AI_RESPONSE_JSON" 2>/dev/null || true)"; then
+              :
+            fi
+            AI_CONTENT="${AI_CONTENT:-}"
+            if [ -n "$(printf '%s' "$AI_CONTENT" | tr -d '[:space:]')" ]; then
+              if printf '%s' "$AI_CONTENT" | grep -Eiq '^\s*(I )?(cannot|can'\''t|am unable|apologize|sorry,|as an ai)'; then
+                echo "::warning::AI rewrite returned refusal-like text; using deterministic fallback."
+              else
+                printf '%s\n' "$AI_CONTENT" > "$AI_BODY_FILE"
+                {
+                  cat "$AI_BODY_FILE"
+                  printf '\n**Full Changelog**: %s\n' "$COMPARE_URL"
+                } > "$NOTES_FILE"
+                AI_OK=1
+                NOTES_MODE="ai"
+              fi
+            else
+              echo "::warning::AI rewrite returned empty content; using deterministic fallback."
+            fi
+          else
+            echo "::warning::GitHub Models call failed; using deterministic fallback."
+          fi
+
+          if [ "$AI_OK" -ne 1 ]; then
+            cp "$BASE_NOTES_FILE" "$NOTES_FILE"
+          fi
+
+          echo "Release notes mode: $NOTES_MODE"
+          echo "notes_mode=$NOTES_MODE" >> "$GITHUB_OUTPUT"
           echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Upload release artifacts to workflow run
