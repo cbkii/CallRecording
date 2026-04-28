@@ -41,7 +41,7 @@ For technical validation steps, see [`scripts/verify_silent_mode.sh`](./scripts/
 1. Install the APK.
 2. Enable the module in your Xposed manager.
 3. Set module scope to: `com.google.android.dialer`.
-4. Reboot device (recommended after first enable).
+4. Reboot device (recommended after first enable) or force stop Google Dialer.
 6. Open Google Dialer.
 
 ### Scope rule (important)
