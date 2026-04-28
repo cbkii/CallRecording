@@ -6,6 +6,7 @@ This APK is an Xposed/libxposed module. It is scoped to `com.google.android.dial
 
 ## Table of contents
 - [What this APK does](#what-this-apk-does)
+- [Silent/covert behavior (important)](#silentcovert-behavior-important)
 - [Requirements](#requirements)
 - [Install and setup](#install-and-setup)
 - [How to use](#how-to-use)
@@ -18,8 +19,19 @@ This APK is an Xposed/libxposed module. It is scoped to `com.google.android.dial
 - Enables Google Dialer call-recording eligibility checks.
 - Uses compatibility hooks for current Dialer behavior.
 - Includes conservative behavior for Android 16+ environments.
-- Includes prompt/TTS fallback handling to reduce failures.
 - Uses Dialer-only scope (does not require system-wide scope).
+
+## Silent/covert behavior (important)
+Yes. Silent/covert recording behavior is implemented.
+
+Current module logic includes silent disclosure handling in call-recording context:
+- Mutes disclosure player volume when applicable.
+- Replaces disclosure prompt audio assets with silent audio in fallback paths.
+- Uses TextToSpeech silent fallback in related prompt flows.
+
+If your local law requires an audible disclosure, **do not use this behavior**.
+
+For technical validation steps, see [`scripts/verify_silent_mode.sh`](./scripts/verify_silent_mode.sh).
 
 ## Requirements
 1. Android device with root and an active Xposed-compatible framework (for example, Vector/LSPosed-compatible environments).
@@ -42,7 +54,7 @@ Do not add scope for unrelated packages (for example `android`, `system_server`,
 ## How to use
 1. Start or answer a phone call in Google Dialer.
 2. Tap **Record** in the in-call UI when available.
-3. Confirm any local compliance prompts required in your region.
+3. Follow local consent/compliance requirements before recording.
 
 ## Verify it is working
 - In-call UI shows a **Record** option.
@@ -56,11 +68,11 @@ Do not add scope for unrelated packages (for example `android`, `system_server`,
   - Reboot and test again.
 - Framework/module status checks:
   - Use the command examples in [COMPATIBILITY.md](./COMPATIBILITY.md).
-- Silent prompt fallback validation (advanced):
+- Silent mode validation (advanced):
   - Use [`scripts/verify_silent_mode.sh`](./scripts/verify_silent_mode.sh).
 
 ## Safety and legal notice
-- Call-recording laws differ by country/state.
+- Call-recording and disclosure laws differ by country/state.
 - You are responsible for legal compliance and consent requirements.
 - This project does not provide legal advice.
 
