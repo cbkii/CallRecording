@@ -31,7 +31,7 @@ android {
     }
     defaultConfig {
         versionCode = 6
-        versionName = "1.6"
+        versionName = "2.0"
         externalNativeBuild {
             ndkBuild {
                 abiFilters += listOf("arm64-v8a")
