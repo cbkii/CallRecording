@@ -193,8 +193,11 @@ com.google.android.googlequicksearchbox
 
 This fork is:
 
-- **Legacy Xposed API** — uses `de.robv.android.xposed.*` only; no `libxposed` migration.  This is
-  intentional: Vector confirms full legacy API consistency with original Xposed.
+- **Dual API entrypoints** — keeps legacy `de.robv.android.xposed.*` entrypoint for broad module
+  compatibility and adds modern `libxposed` API 101 metadata/entry for Vector modern mode.
+- **Modern libxposed API 101-ready entry** — ships `META-INF/xposed/java_init.list`,
+  `module.prop` (`minApiVersion=101`, `targetApiVersion=101`) and static scope metadata for
+  `com.google.android.dialer`.
 - **Dialer-only scope** — `com.google.android.dialer` / no system or GMS scopes.
 - **Vector-compatible** — all hooks, param methods, and module metadata confirmed correct against
   Vector v2.0 (commit `b71c33d`).
@@ -247,6 +250,21 @@ Recording **cannot** start:
 
 Recordings are stored inside the Phone app call history.  Deleting a call log entry may also
 delete its recording.
+
+### Silent fallback mode (Pixel AU / Android 16)
+
+This fork now keeps **silent prompt fallback enabled by default** for release reliability on
+Pixel devices in AU-supported regions. Prompt/TTS failures are auto-rerouted to a bundled
+`silent_16k.wav` asset, and call-recording disclosure playback is muted when hooks resolve the
+Dialer disclosure player successfully.
+
+Expected diagnostic logs include:
+
+- `Recording: Silent mode active`
+- `speak(CharSequence,int,Bundle): silent fallback engaged`
+- `synthesizeToFile: TTS failed, writing silent wav fallback`
+
+This behavior is designed for interruption-free local recording UX while preserving Dialer flow.
 
 ---
 
