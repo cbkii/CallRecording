@@ -1,8 +1,8 @@
 # Call Recording (Google Dialer module)
 
-Enable the **Record** button in **Google Dialer** for supported call flows.
+A module to enable the **Record** button in **Google Dialer**.
 
-This APK is an Xposed/libxposed module. It is scoped to `com.google.android.dialer` only.
+This APK is an Xposed/libxposed (API 100 + 101) module. It is scoped to `com.google.android.dialer` only. Designed for Android 16 Pixel devices (tested on tegu).
 
 ## Table of contents
 - [What this APK does](#what-this-apk-does)
@@ -12,7 +12,6 @@ This APK is an Xposed/libxposed module. It is scoped to `com.google.android.dial
 - [How to use](#how-to-use)
 - [Verify it is working](#verify-it-is-working)
 - [Troubleshooting](#troubleshooting)
-- [Safety and legal notice](#safety-and-legal-notice)
 - [More technical docs](#more-technical-docs)
 
 ## What this APK does
@@ -43,7 +42,7 @@ For technical validation steps, see [`scripts/verify_silent_mode.sh`](./scripts/
 2. Enable the module in your Xposed manager.
 3. Set module scope to: `com.google.android.dialer`.
 4. Reboot device (recommended after first enable).
-5. Open Google Dialer.
+6. Open Google Dialer.
 
 ### Scope rule (important)
 Use only:
@@ -61,20 +60,18 @@ Do not add scope for unrelated packages (for example `android`, `system_server`,
 - Recording starts without Dialer crash.
 - If needed, verify module/scope/logs with the diagnostic steps in [COMPATIBILITY.md](./COMPATIBILITY.md).
 
+> **Safety and legal notice**: Call-recording and disclosure laws differ by country/state. You are responsible for legal compliance and consent requirements.
+
 ## Troubleshooting
 - Record button not shown:
   - Confirm module is enabled.
   - Confirm scope is exactly `com.google.android.dialer`.
+  - Confirm "Call Recording" is enabled in Dialer settings (Call Assist > Call Recording).
   - Reboot and test again.
 - Framework/module status checks:
   - Use the command examples in [COMPATIBILITY.md](./COMPATIBILITY.md).
 - Silent mode validation (advanced):
   - Use [`scripts/verify_silent_mode.sh`](./scripts/verify_silent_mode.sh).
-
-## Safety and legal notice
-- Call-recording and disclosure laws differ by country/state.
-- You are responsible for legal compliance and consent requirements.
-- This project does not provide legal advice.
 
 ## More technical docs
 - Compatibility details and CLI diagnostics: [COMPATIBILITY.md](./COMPATIBILITY.md)
