@@ -328,6 +328,7 @@ public class Init implements IXposedHookLoadPackage {
     /**
      * Returns a File pre-written with silent WAV bytes, creating and caching it on first call.
      * Used to back {@link AssetFileDescriptor} responses for silent audio interception.
+     * The file persists for the lifetime of the Dialer process; no explicit deletion is needed.
      */
     private static File getSilentTempFile() {
         File f = silentTempFile;
@@ -337,7 +338,6 @@ public class Init implements IXposedHookLoadPackage {
             if (f != null && f.exists()) return f;
             try {
                 f = File.createTempFile("silent_disclosure_", ".wav");
-                f.deleteOnExit();
                 try (FileOutputStream fos = new FileOutputStream(f)) {
                     fos.write(getSilentPromptWavBytes());
                 }
@@ -853,6 +853,11 @@ public class Init implements IXposedHookLoadPackage {
      * Hooks {@code AssetManager.openFd(String)} to intercept disclosure audio assets opened as
      * file descriptors (e.g. when Dialer feeds an {@link AssetFileDescriptor} directly to
      * {@code MediaPlayer.setDataSource}).
+     *
+     * <p>Each call creates a new {@link ParcelFileDescriptor} opened on the cached silent temp
+     * file. Ownership of both the PFD and the returned {@link AssetFileDescriptor} is transferred
+     * to the caller; the caller is responsible for closing the {@link AssetFileDescriptor}, which
+     * in turn closes the underlying PFD (standard {@link AssetFileDescriptor#close()} contract).
      */
     private static void hookAssetManagerOpenFd() {
         try {
@@ -865,6 +870,7 @@ public class Init implements IXposedHookLoadPackage {
                     File tmp = getSilentTempFile();
                     if (tmp == null) return;
                     try {
+                        // Ownership of pfd and the returned afd is transferred to the caller.
                         ParcelFileDescriptor pfd = ParcelFileDescriptor.open(
                                 tmp, ParcelFileDescriptor.MODE_READ_ONLY);
                         param.setResult(new AssetFileDescriptor(pfd, 0, tmp.length()));
