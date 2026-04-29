@@ -1,5 +1,9 @@
 name: Manual Release APK Variants
 
+run-name: >-
+  Manual release ${{ inputs.tag || inputs.version || 'from-versionName' }}
+  from ${{ inputs.target_ref || github.ref_name }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -62,7 +66,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
-      models: read
 
     steps:
       - name: Check out source
