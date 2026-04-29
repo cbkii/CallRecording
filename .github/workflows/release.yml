@@ -50,9 +50,9 @@ on:
         type: boolean
         default: true
       target_ref:
-        description: "Branch, tag, or SHA to release from (manual trigger safety)."
+        description: "Branch, tag, or SHA to release from (leave blank to use the triggering ref)."
         required: false
-        default: "main"
+        default: ""
 
 concurrency:
   # Scope concurrency by workflow + selected ref so manual runs do not collide unexpectedly.
@@ -75,10 +75,17 @@ jobs:
           ref: ${{ inputs.target_ref || github.ref_name }}
 
       - name: Validate selected source ref
+        id: source_ref
         shell: bash
         run: |
           set -euo pipefail
           REQUESTED_REF="${{ inputs.target_ref || github.ref_name }}"
+          if git show-ref --verify --quiet "refs/remotes/origin/${REQUESTED_REF}"; then
+            echo "push_ref=$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::target_ref must be a branch for this workflow because it commits and pushes versionName."
+            exit 1
+          fi
           RESOLVED_SHA="$(git rev-parse HEAD)"
           echo "Manual release source ref: $REQUESTED_REF"
           echo "Manual release source SHA: $RESOLVED_SHA"
@@ -177,7 +184,7 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add app/build.gradle.kts
             git commit -m "chore: align app versionName with release tag ${{ steps.meta.outputs.tag }} [skip ci]"
-            git push origin "HEAD:${{ github.ref_name }}"
+            git push origin "HEAD:${{ steps.source_ref.outputs.push_ref }}"
           else
             echo "app/build.gradle.kts already uses versionName=$TARGET_VERSION"
           fi
