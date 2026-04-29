@@ -17,7 +17,8 @@ public class ModernInit extends XposedModule {
             Init.handleDialerPackageLoad(
                     param.getPackageName(),
                     processName,
-                    param.getDefaultClassLoader());
+                    param.getDefaultClassLoader(),
+                    "modern");
             log(Log.WARN, TAG, "Modern API entry active");
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "Modern API entry failed", t);

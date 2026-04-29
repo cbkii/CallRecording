@@ -26,10 +26,11 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -42,6 +43,73 @@ import io.github.vvb2060.callrecording.BuildConfig;
 
 public class Init implements IXposedHookLoadPackage {
     private static final String TAG = "CallRecording";
+
+    // -------------------------------------------------------------------------
+    // Hook status / group tracking
+    // -------------------------------------------------------------------------
+
+    /**
+     * Per-hook installation status.
+     *
+     * <ul>
+     *   <li>INSTALLED – hook wired and active.</li>
+     *   <li>SKIPPED – intentionally not installed (config flag off).</li>
+     *   <li>FAILED – installation threw; hook is absent.</li>
+     *   <li>AMBIGUOUS – multiple plausible Dex targets found; first used with a warning.</li>
+     *   <li>OBSERVE_ONLY – hook wired but result modifications suppressed (OBSERVE_ONLY mode).</li>
+     *   <li>NOT_FOUND – target method/class absent in this Dialer build.</li>
+     * </ul>
+     */
+    enum HookStatus {
+        INSTALLED, SKIPPED, FAILED, AMBIGUOUS, OBSERVE_ONLY, NOT_FOUND
+    }
+
+    /**
+     * Collects per-hook statuses for a logical group.
+     * Logs every non-INSTALLED status immediately for easy triage.
+     */
+    static final class GroupResult {
+        final String id;
+        final LinkedHashMap<String, HookStatus> hooks = new LinkedHashMap<>();
+
+        GroupResult(String id) {
+            this.id = id;
+        }
+
+        void put(String hookId, HookStatus status) {
+            hooks.put(hookId, status);
+            if (status == HookStatus.FAILED
+                    || status == HookStatus.AMBIGUOUS
+                    || status == HookStatus.NOT_FOUND) {
+                Log.w(TAG, "hook[" + hookId + "] " + status + " in group=" + id);
+            } else if (ENABLE_VERBOSE_LOGGING) {
+                Log.d(TAG, "hook[" + hookId + "] " + status + " in group=" + id);
+            }
+        }
+
+        boolean hasDegradation() {
+            for (HookStatus s : hooks.values()) {
+                if (s == HookStatus.FAILED
+                        || s == HookStatus.NOT_FOUND
+                        || s == HookStatus.AMBIGUOUS) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder sb = new StringBuilder(id).append('{');
+            boolean first = true;
+            for (Map.Entry<String, HookStatus> e : hooks.entrySet()) {
+                if (!first) sb.append(' ');
+                sb.append(e.getKey()).append('=').append(e.getValue());
+                first = false;
+            }
+            return sb.append('}').toString();
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Configuration constants – change these at compile time to switch behaviour
@@ -131,6 +199,11 @@ public class Init implements IXposedHookLoadPackage {
     // Xposed entrypoints are active simultaneously).
     private static final AtomicBoolean hooksInstalled = new AtomicBoolean(false);
 
+    // Tracks utteranceIds for which TTS lifecycle callbacks have already been fired,
+    // preventing duplicate onStart/onDone delivery when a synthesis path is entered twice.
+    private static final java.util.Set<String> completedUtteranceIds =
+            ConcurrentHashMap.newKeySet();
+
     // Tracks whether a synthesizeToFile call was recently intercepted so that speak() hooks
     // can suppress TTS callbacks that arrive asynchronously (after the recording-context
     // class names have left the call stack).
@@ -139,6 +212,9 @@ public class Init implements IXposedHookLoadPackage {
     // Runnable used to clear the session flag after a grace period.
     private static final Runnable clearCallRecordingSession = () -> {
         inCallRecordingSession = false;
+        // Also clear any utteranceId entries that were recorded in this session
+        // so they can be legitimately dispatched if reused in a future session.
+        completedUtteranceIds.clear();
         Log.d(TAG, "inCallRecordingSession: cleared");
     };
 
@@ -155,7 +231,7 @@ public class Init implements IXposedHookLoadPackage {
     // Silent WAV fallback (1 channel, 16-bit PCM, empty audio)
     // -------------------------------------------------------------------------
 
-    private static final byte[] wav = {
+    static final byte[] wav = {
             82, 73, 70, 70, 36, 0, 0, 0, 87, 65, 86,
             69, 102, 109, 116, 32, 16, 0, 0, 0, 1, 0,
             1, 0, -128, 62, 0, 0, 0, 125, 0, 0, 2,
@@ -300,7 +376,7 @@ public class Init implements IXposedHookLoadPackage {
         return Locale.US;
     }
 
-    private static boolean isUnsupportedRecordingCountryCode(String countryCode) {
+    static boolean isUnsupportedRecordingCountryCode(String countryCode) {
         if (countryCode == null) return true;
         String normalized = countryCode.trim().toUpperCase(Locale.ROOT);
         if (normalized.isEmpty()) return true;
@@ -375,7 +451,7 @@ public class Init implements IXposedHookLoadPackage {
      * Returns true when the asset name looks like a call-recording disclosure audio file.
      * The filename keyword filter is the primary guard; no stack-trace inspection needed.
      */
-    private static boolean isDisclosureAudioAsset(String name) {
+    static boolean isDisclosureAudioAsset(String name) {
         if (name == null) return false;
         String lower = name.toLowerCase(Locale.ROOT);
         boolean hasKeyword = lower.contains("record")
@@ -447,6 +523,13 @@ public class Init implements IXposedHookLoadPackage {
         Handler h = getMainHandler();
         if (h == null) {
             Log.w(TAG, "fireTtsCallbacks: main looper unavailable, cannot dispatch callbacks");
+            return;
+        }
+        // Only mark the utteranceId as completed after we've confirmed both the listener and
+        // handler exist — preventing permanent suppression when dispatch was never possible.
+        if (!completedUtteranceIds.add(utteranceId)) {
+            Log.d(TAG, "fireTtsCallbacks: already completed utteranceId=" + utteranceId
+                    + ", skipping duplicate");
             return;
         }
         h.post(() -> {
@@ -538,7 +621,7 @@ public class Init implements IXposedHookLoadPackage {
      * Installs a side-effect-preserving after-hook that forces the boolean return to true.
      * The original method runs first so any internal cache/state initialisation is preserved.
      */
-    private static void hookBooleanReturnTrue(String label, java.lang.reflect.Member method) {
+    private static HookStatus hookBooleanReturnTrue(String label, java.lang.reflect.Member method) {
         logHookTarget(label, method);
         XposedBridge.hookMethod(method, new XC_MethodHook() {
             @Override
@@ -570,162 +653,158 @@ public class Init implements IXposedHookLoadPackage {
                 }
             }
         });
+        return MODE == RecordingCompatibilityMode.OBSERVE_ONLY
+                ? HookStatus.OBSERVE_ONLY : HookStatus.INSTALLED;
     }
 
     // -------------------------------------------------------------------------
     // DexHelper hooks
     // -------------------------------------------------------------------------
 
-    private static void hookCanRecordCall(DexHelper dex) {
-        var canRecordCall = Arrays.stream(
-                        dex.findMethodUsingString("canRecordCall",
-                                false,
-                                -1,
-                                (short) 0,
-                                "Z",
-                                -1,
-                                null,
-                                null,
-                                null,
-                                true))
-                .mapToObj(dex::decodeMethodIndex)
-                .filter(Objects::nonNull)
-                .findFirst();
-        if (canRecordCall.isPresent()) {
-            hookBooleanReturnTrue("canRecordCall", canRecordCall.get());
-        } else {
+    private static HookStatus hookCanRecordCall(DexHelper dex) {
+        long[] candidates = dex.findMethodUsingString("canRecordCall",
+                false, -1, (short) 0, "Z", -1, null, null, null, false);
+        if (candidates.length == 0) {
             Log.e(TAG, "canRecordCall method not found");
+            return HookStatus.NOT_FOUND;
         }
+        if (candidates.length > 1) {
+            Log.w(TAG, "canRecordCall: " + candidates.length
+                    + " candidates, using first (AMBIGUOUS)");
+        }
+        java.lang.reflect.Member method = dex.decodeMethodIndex(candidates[0]);
+        if (method == null) {
+            Log.e(TAG, "canRecordCall: decodeMethodIndex returned null");
+            return HookStatus.FAILED;
+        }
+        HookStatus s = hookBooleanReturnTrue("canRecordCall", method);
+        return candidates.length > 1 ? HookStatus.AMBIGUOUS : s;
     }
 
-    private static void hookWithinCrosbyGeoFence(DexHelper dex) {
-        var withinCrosbyGeoFence = Arrays.stream(
-                        dex.findMethodUsingString("withinCrosbyGeoFence",
-                                false,
-                                -1,
-                                (short) 0,
-                                "Z",
-                                -1,
-                                null,
-                                null,
-                                null,
-                                true))
-                .mapToObj(dex::decodeMethodIndex)
-                .filter(Objects::nonNull)
-                .findFirst();
-        if (withinCrosbyGeoFence.isPresent()) {
-            hookBooleanReturnTrue("withinCrosbyGeoFence", withinCrosbyGeoFence.get());
-        } else {
+    private static HookStatus hookWithinCrosbyGeoFence(DexHelper dex) {
+        long[] candidates = dex.findMethodUsingString("withinCrosbyGeoFence",
+                false, -1, (short) 0, "Z", -1, null, null, null, false);
+        if (candidates.length == 0) {
             Log.w(TAG, "withinCrosbyGeoFence method not found");
+            return HookStatus.NOT_FOUND;
         }
+        if (candidates.length > 1) {
+            Log.w(TAG, "withinCrosbyGeoFence: " + candidates.length
+                    + " candidates, using first (AMBIGUOUS)");
+        }
+        java.lang.reflect.Member method = dex.decodeMethodIndex(candidates[0]);
+        if (method == null) {
+            Log.e(TAG, "withinCrosbyGeoFence: decodeMethodIndex returned null");
+            return HookStatus.FAILED;
+        }
+        HookStatus s = hookBooleanReturnTrue("withinCrosbyGeoFence", method);
+        return candidates.length > 1 ? HookStatus.AMBIGUOUS : s;
     }
 
-    private static void hookGetSupportedLocaleFromCountryCode(DexHelper dex) {
+    private static HookStatus hookGetSupportedLocaleFromCountryCode(DexHelper dex) {
         var localeId = dex.encodeClassIndex(Locale.class);
         var mapId = dex.encodeClassIndex(Map.class);
         var stringId = dex.encodeClassIndex(String.class);
-        var getSupportedLocaleFromCountryCode = Arrays.stream(
-                        dex.findMethodUsingString("getSupportedLocaleFromCountryCode",
-                                false,
-                                localeId,
-                                (short) 2,
-                                null,
-                                -1,
-                                new long[]{mapId, stringId},
-                                null,
-                                null,
-                                true))
-                .mapToObj(dex::decodeMethodIndex)
-                .filter(Objects::nonNull)
-                .findFirst();
-        if (getSupportedLocaleFromCountryCode.isPresent()) {
-            var method = getSupportedLocaleFromCountryCode.get();
-            logHookTarget("getSupportedLocaleFromCountryCode", method);
-            XposedBridge.hookMethod(method, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    Locale fallback = safeRecordingFallbackLocale();
-
-                    if (MODE == RecordingCompatibilityMode.OBSERVE_ONLY) {
-                        Log.d(TAG, "getSupportedLocaleFromCountryCode: OBSERVE_ONLY"
-                                + " args=" + Arrays.toString(param.args)
-                                + " original=" + param.getResult());
-                        return;
-                    }
-
-                    if (param.hasThrowable()) {
-                        Log.w(TAG, "getSupportedLocaleFromCountryCode original threw; fallback="
-                                + fallback, param.getThrowable());
-                        param.setThrowable(null);
-                        param.setResult(fallback);
-                        Log.w(TAG, "getSupportedLocaleFromCountryCode: locale original=<threw>"
-                                + " final=" + fallback);
-                        return;
-                    }
-
-                    Object original = param.getResult();
-                    String countryCode = extractCountryCodeArg(param.args);
-                    boolean unsupportedCountry = isUnsupportedRecordingCountryCode(countryCode);
-                    if (ENABLE_VERBOSE_LOGGING) {
-                        Log.d(TAG, "getSupportedLocaleFromCountryCode args="
-                                + Arrays.toString(param.args) + " original=" + original
-                                + " unsupportedCountry=" + unsupportedCountry);
-                    }
-
-                    if (FORCE_US_RECORDING_LOCALE) {
-                        // Always override to the forced locale but still ran original above
-                        Log.d(TAG, "getSupportedLocaleFromCountryCode: locale original="
-                                + original + " final=" + fallback + " (forced)");
-                        param.setResult(fallback);
-                        return;
-                    }
-
-                    if (!unsupportedCountry && original instanceof Locale) {
-                        // Preserve Dialer's own successful locale only when country is supported.
-                        Log.d(TAG, "getSupportedLocaleFromCountryCode: country=" + countryCode
-                                + " locale original=" + original + " final=" + original
-                                + " (preserved)");
-                        return;
-                    }
-
-                    Log.w(TAG, "getSupportedLocaleFromCountryCode: country=" + countryCode
-                            + " locale original=" + original
-                            + " (null/unsupported country) final=" + fallback);
-                    param.setResult(fallback);
-                }
-            });
-        } else {
+        long[] candidates = dex.findMethodUsingString("getSupportedLocaleFromCountryCode",
+                false, localeId, (short) 2, null, -1,
+                new long[]{mapId, stringId}, null, null, false);
+        if (candidates.length == 0) {
             Log.e(TAG, "getSupportedLocaleFromCountryCode method not found");
+            return HookStatus.NOT_FOUND;
         }
+        if (candidates.length > 1) {
+            Log.w(TAG, "getSupportedLocaleFromCountryCode: " + candidates.length
+                    + " candidates, using first (AMBIGUOUS)");
+        }
+        java.lang.reflect.Member method = dex.decodeMethodIndex(candidates[0]);
+        if (method == null) {
+            Log.e(TAG, "getSupportedLocaleFromCountryCode: decodeMethodIndex returned null");
+            return HookStatus.FAILED;
+        }
+        logHookTarget("getSupportedLocaleFromCountryCode", method);
+        XposedBridge.hookMethod(method, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                Locale fallback = safeRecordingFallbackLocale();
+
+                if (MODE == RecordingCompatibilityMode.OBSERVE_ONLY) {
+                    Log.d(TAG, "getSupportedLocaleFromCountryCode: OBSERVE_ONLY"
+                            + " args=" + Arrays.toString(param.args)
+                            + " original=" + param.getResult());
+                    return;
+                }
+
+                if (param.hasThrowable()) {
+                    Log.w(TAG, "getSupportedLocaleFromCountryCode original threw; fallback="
+                            + fallback, param.getThrowable());
+                    param.setThrowable(null);
+                    param.setResult(fallback);
+                    Log.w(TAG, "getSupportedLocaleFromCountryCode: locale original=<threw>"
+                            + " final=" + fallback);
+                    return;
+                }
+
+                Object original = param.getResult();
+                String countryCode = extractCountryCodeArg(param.args);
+                boolean unsupportedCountry = isUnsupportedRecordingCountryCode(countryCode);
+                if (ENABLE_VERBOSE_LOGGING) {
+                    Log.d(TAG, "getSupportedLocaleFromCountryCode args="
+                            + Arrays.toString(param.args) + " original=" + original
+                            + " unsupportedCountry=" + unsupportedCountry);
+                }
+
+                if (FORCE_US_RECORDING_LOCALE) {
+                    // Always override to the forced locale but still ran original above
+                    Log.d(TAG, "getSupportedLocaleFromCountryCode: locale original="
+                            + original + " final=" + fallback + " (forced)");
+                    param.setResult(fallback);
+                    return;
+                }
+
+                if (!unsupportedCountry && original instanceof Locale) {
+                    // Preserve Dialer's own successful locale only when country is supported.
+                    Log.d(TAG, "getSupportedLocaleFromCountryCode: country=" + countryCode
+                            + " locale original=" + original + " final=" + original
+                            + " (preserved)");
+                    return;
+                }
+
+                Log.w(TAG, "getSupportedLocaleFromCountryCode: country=" + countryCode
+                        + " locale original=" + original
+                        + " (null/unsupported country) final=" + fallback);
+                param.setResult(fallback);
+            }
+        });
+        HookStatus base = MODE == RecordingCompatibilityMode.OBSERVE_ONLY
+                ? HookStatus.OBSERVE_ONLY : HookStatus.INSTALLED;
+        return candidates.length > 1 ? HookStatus.AMBIGUOUS : base;
     }
 
-    private static void hookIsCallRecordingCountry(DexHelper dex) {
-        var isCallRecordingCountry = Arrays.stream(
-                        dex.findMethodUsingString("isCallRecordingCountry",
-                                false,
-                                -1,
-                                (short) 0,
-                                "Z",
-                                -1,
-                                null,
-                                null,
-                                null,
-                                true))
-                .mapToObj(dex::decodeMethodIndex)
-                .filter(Objects::nonNull)
-                .findFirst();
-        if (isCallRecordingCountry.isPresent()) {
-            hookBooleanReturnTrue("isCallRecordingCountry", isCallRecordingCountry.get());
-        } else {
+    private static HookStatus hookIsCallRecordingCountry(DexHelper dex) {
+        long[] candidates = dex.findMethodUsingString("isCallRecordingCountry",
+                false, -1, (short) 0, "Z", -1, null, null, null, false);
+        if (candidates.length == 0) {
             Log.e(TAG, "isCallRecordingCountry method not found");
+            return HookStatus.NOT_FOUND;
         }
+        if (candidates.length > 1) {
+            Log.w(TAG, "isCallRecordingCountry: " + candidates.length
+                    + " candidates, using first (AMBIGUOUS)");
+        }
+        java.lang.reflect.Member method = dex.decodeMethodIndex(candidates[0]);
+        if (method == null) {
+            Log.e(TAG, "isCallRecordingCountry: decodeMethodIndex returned null");
+            return HookStatus.FAILED;
+        }
+        HookStatus s = hookBooleanReturnTrue("isCallRecordingCountry", method);
+        return candidates.length > 1 ? HookStatus.AMBIGUOUS : s;
     }
 
     // -------------------------------------------------------------------------
     // TTS / prompt hooks (staged, side-effect preserving)
     // -------------------------------------------------------------------------
 
-    private static void hookIsLanguageAvailable() {
+    private static HookStatus hookIsLanguageAvailable() {
         try {
             Method isLanguageAvailable = TextToSpeech.class.getDeclaredMethod(
                     "isLanguageAvailable", Locale.class);
@@ -759,8 +838,10 @@ public class Init implements IXposedHookLoadPackage {
                     }
                 }
             });
+            return HookStatus.INSTALLED;
         } catch (NoSuchMethodException e) {
             Log.e(TAG, "isLanguageAvailable method not found", e);
+            return HookStatus.NOT_FOUND;
         }
     }
 
@@ -779,7 +860,7 @@ public class Init implements IXposedHookLoadPackage {
      * calls within the session window are also suppressed, even from async threads that no
      * longer carry the recording-context class names in their stack traces.
      */
-    private static void hookSynthesizeToFile() {
+    private static HookStatus hookSynthesizeToFile() {
         try {
             Method synthesizeToFile = TextToSpeech.class.getDeclaredMethod("synthesizeToFile",
                     CharSequence.class, Bundle.class, File.class, String.class);
@@ -829,8 +910,10 @@ public class Init implements IXposedHookLoadPackage {
                     fireTtsCallbacks(param.thisObject, utteranceId);
                 }
             });
+            return HookStatus.INSTALLED;
         } catch (NoSuchMethodException e) {
             Log.e(TAG, "synthesizeToFile method not found", e);
+            return HookStatus.NOT_FOUND;
         }
     }
 
@@ -851,7 +934,7 @@ public class Init implements IXposedHookLoadPackage {
      * so no real TTS queue entry is created. Proper {@code onStart}/{@code onDone} callbacks
      * are then posted to the main thread so Dialer state machines advance normally.
      */
-    private static void hookSpeak() {
+    private static HookStatus hookSpeak() {
         try {
             Method speak = TextToSpeech.class.getDeclaredMethod(
                     "speak", CharSequence.class, int.class, Bundle.class, String.class);
@@ -879,12 +962,14 @@ public class Init implements IXposedHookLoadPackage {
                     fireTtsCallbacks(param.thisObject, utteranceId);
                 }
             });
+            return HookStatus.INSTALLED;
         } catch (NoSuchMethodException e) {
             Log.w(TAG, "speak(CharSequence,int,Bundle,String) not found", e);
+            return HookStatus.NOT_FOUND;
         }
     }
 
-    private static void hookCallRecordingDisclosure(ClassLoader classLoader) {
+    private static HookStatus hookCallRecordingDisclosure(ClassLoader classLoader) {
         try {
             Class<?> disclosureClass = XposedHelpers.findClass(
                     "com.google.android.dialer.callcomposer.CallRecordingDisclosure",
@@ -896,8 +981,10 @@ public class Init implements IXposedHookLoadPackage {
                 }
             });
             Log.w(TAG, "CallRecordingDisclosure constructor hook installed");
+            return HookStatus.INSTALLED;
         } catch (Throwable t) {
             Log.w(TAG, "CallRecordingDisclosure constructor hook unavailable", t);
+            return HookStatus.NOT_FOUND;
         }
     }
 
@@ -941,7 +1028,9 @@ public class Init implements IXposedHookLoadPackage {
         Log.d(TAG, "setDisclosurePlayerSilent: no player found at construction time");
     }
 
-    private static void hookAssetManagerOpen() {
+    private static HookStatus hookAssetManagerOpen() {
+        // Track whether at least one variant was successfully hooked.
+        boolean anyInstalled = false;
         // Hook open(String) – the most common asset-open path.
         try {
             Method open = AssetManager.class.getDeclaredMethod("open", String.class);
@@ -954,6 +1043,7 @@ public class Init implements IXposedHookLoadPackage {
                     Log.w(TAG, "AssetManager.open: replaced prompt audio: " + param.args[0]);
                 }
             });
+            anyInstalled = true;
         } catch (Throwable t) {
             Log.w(TAG, "AssetManager.open(String) hook unavailable", t);
         }
@@ -969,9 +1059,11 @@ public class Init implements IXposedHookLoadPackage {
                     Log.w(TAG, "AssetManager.open(String,int): replaced prompt audio: " + param.args[0]);
                 }
             });
+            anyInstalled = true;
         } catch (Throwable t) {
             Log.w(TAG, "AssetManager.open(String,int) hook unavailable", t);
         }
+        return anyInstalled ? HookStatus.INSTALLED : HookStatus.FAILED;
     }
 
     /**
@@ -984,7 +1076,7 @@ public class Init implements IXposedHookLoadPackage {
      * to the caller; the caller is responsible for closing the {@link AssetFileDescriptor}, which
      * in turn closes the underlying PFD (standard {@link AssetFileDescriptor#close()} contract).
      */
-    private static void hookAssetManagerOpenFd() {
+    private static HookStatus hookAssetManagerOpenFd() {
         try {
             Method openFd = AssetManager.class.getDeclaredMethod("openFd", String.class);
             XposedBridge.hookMethod(openFd, new XC_MethodHook() {
@@ -1006,8 +1098,10 @@ public class Init implements IXposedHookLoadPackage {
                     }
                 }
             });
+            return HookStatus.INSTALLED;
         } catch (Throwable t) {
             Log.w(TAG, "AssetManager.openFd hook unavailable", t);
+            return HookStatus.NOT_FOUND;
         }
     }
 
@@ -1015,7 +1109,7 @@ public class Init implements IXposedHookLoadPackage {
     // Activity.onResume version/permission check
     // -------------------------------------------------------------------------
 
-    private static void hookActivityOnResume() {
+    private static HookStatus hookActivityOnResume() {
         try {
             Method onResume = Activity.class.getDeclaredMethod("onResume");
             XposedBridge.hookMethod(onResume, new XC_MethodHook() {
@@ -1040,8 +1134,10 @@ public class Init implements IXposedHookLoadPackage {
                     }
                 }
             });
+            return HookStatus.INSTALLED;
         } catch (NoSuchMethodException e) {
             Log.e(TAG, "onResume method not found", e);
+            return HookStatus.NOT_FOUND;
         }
     }
 
@@ -1080,15 +1176,48 @@ public class Init implements IXposedHookLoadPackage {
     }
 
     // -------------------------------------------------------------------------
+    // Startup summary
+    // -------------------------------------------------------------------------
+
+    private static void printStartupSummary(String entrypoint, String processName,
+            boolean safeProfile, List<GroupResult> groups) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== CallRecording startup ===\n");
+        sb.append("  process=").append(processName)
+                .append(" entrypoint=").append(entrypoint).append('\n');
+        sb.append("  sdk=").append(Build.VERSION.SDK_INT)
+                .append(" device=").append(Build.DEVICE)
+                .append(" model=").append(Build.MODEL).append('\n');
+        sb.append("  mode=").append(MODE)
+                .append(" safeProfile=").append(safeProfile)
+                .append(" conservative=").append(conservativeMode).append('\n');
+        sb.append("  groups:\n");
+        List<String> degraded = new ArrayList<>();
+        for (GroupResult g : groups) {
+            sb.append("    ").append(g).append('\n');
+            if (g.hasDegradation()) degraded.add(g.id);
+        }
+        if (degraded.isEmpty()) {
+            sb.append("  degraded: none\n");
+        } else {
+            sb.append("  degraded: ").append(degraded).append('\n');
+        }
+        sb.append("=== startup complete ===");
+        Log.w(TAG, sb.toString());
+    }
+
+    // -------------------------------------------------------------------------
     // Entry point
     // -------------------------------------------------------------------------
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        handleDialerPackageLoad(lpparam.packageName, lpparam.processName, lpparam.classLoader);
+        handleDialerPackageLoad(lpparam.packageName, lpparam.processName,
+                lpparam.classLoader, "legacy");
     }
 
-    static void handleDialerPackageLoad(String packageName, String processName, ClassLoader classLoader) {
+    static void handleDialerPackageLoad(String packageName, String processName,
+            ClassLoader classLoader, String entrypoint) {
         if (!"com.google.android.dialer".equals(packageName)) return;
 
         // Only install hooks in the main Dialer process. Sub-processes (e.g. ":remote", ":ui")
@@ -1101,8 +1230,8 @@ public class Init implements IXposedHookLoadPackage {
         // Guard against duplicate hook installation when both legacy and modern Xposed
         // entrypoints are active at the same time in the same process.
         if (!hooksInstalled.compareAndSet(false, true)) {
-            Log.w(TAG, "Hooks already installed; skipping duplicate entry for process="
-                    + processName);
+            Log.w(TAG, "Hooks already installed; skipping duplicate entry (" + entrypoint
+                    + ") for process=" + processName);
             return;
         }
 
@@ -1111,21 +1240,6 @@ public class Init implements IXposedHookLoadPackage {
         }
 
         boolean safeProfile = ENABLE_ANDROID16_SAFE_PROFILE && isAndroid16();
-
-        Log.w(TAG, "handleLoadPackage: " + packageName
-                + " process=" + processName
-                + " device=" + Build.DEVICE
-                + " model=" + Build.MODEL
-                + " sdk=" + Build.VERSION.SDK_INT
-                + " mode=" + MODE);
-        Log.w(TAG, "safeProfile=" + safeProfile
-                + " promptTtsHooks=" + ENABLE_PROMPT_TTS_HOOKS
-                + " silentPromptFallback=" + ENABLE_SILENT_PROMPT_FALLBACK
-                + " forceUSLocale=" + FORCE_US_RECORDING_LOCALE);
-
-        if (safeProfile) {
-            Log.w(TAG, "Android 16 safe profile active");
-        }
 
         // Environment consistency check runs synchronously so hook installation
         // decisions below can use the result immediately.
@@ -1144,63 +1258,63 @@ public class Init implements IXposedHookLoadPackage {
             }
         }
 
-        if (conservativeMode) {
-            Log.w(TAG, "conservative mode active due to inconsistent environment: "
-                    + conservativeReasons);
-        }
-        Log.w(TAG, "conservativeMode=" + conservativeMode);
+        List<GroupResult> groups = new ArrayList<>();
 
-        // Hook installation is synchronous (no background thread) for determinism.
+        // ----- Group: eligibility (DexHelper – required for Record button) -----
+        GroupResult eligibility = new GroupResult("eligibility");
         try (var dex = new DexHelper(classLoader)) {
-            hookCanRecordCall(dex);
-            hookWithinCrosbyGeoFence(dex);
-            hookGetSupportedLocaleFromCountryCode(dex);
-            hookIsCallRecordingCountry(dex);
+            eligibility.put("canRecordCall", hookCanRecordCall(dex));
+            eligibility.put("withinCrosbyGeoFence", hookWithinCrosbyGeoFence(dex));
+            eligibility.put("isCallRecordingCountry", hookIsCallRecordingCountry(dex));
         } catch (Throwable t) {
-            Log.e(TAG, "Failed to install DexHelper hooks", t);
+            Log.e(TAG, "DexHelper (eligibility group) init failed", t);
+            eligibility.put("dex-init", HookStatus.FAILED);
         }
+        groups.add(eligibility);
 
+        // ----- Group: locale/region (DexHelper – country-code locale fallback) -----
+        GroupResult locale = new GroupResult("locale");
+        try (var dex = new DexHelper(classLoader)) {
+            locale.put("getSupportedLocaleFromCountryCode",
+                    hookGetSupportedLocaleFromCountryCode(dex));
+        } catch (Throwable t) {
+            Log.e(TAG, "DexHelper (locale group) init failed", t);
+            locale.put("dex-init", HookStatus.FAILED);
+        }
+        groups.add(locale);
+
+        // ----- Group: tts (TextToSpeech – silent prompt synthesis) -----
+        GroupResult tts = new GroupResult("tts");
         if (ENABLE_PROMPT_TTS_HOOKS) {
-            try {
-                hookSynthesizeToFile();
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to install synthesizeToFile hook", t);
-            }
-            try {
-                hookSpeak();
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to install speak hook", t);
-            }
-            try {
-                hookIsLanguageAvailable();
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to install isLanguageAvailable hook", t);
-            }
-            try {
-                hookAssetManagerOpen();
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to install AssetManager.open hook", t);
-            }
-            try {
-                hookAssetManagerOpenFd();
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to install AssetManager.openFd hook", t);
-            }
-            try {
-                hookCallRecordingDisclosure(classLoader);
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to install CallRecordingDisclosure hook", t);
-            }
+            tts.put("synthesizeToFile", hookSynthesizeToFile());
+            tts.put("speak", hookSpeak());
+            tts.put("isLanguageAvailable", hookIsLanguageAvailable());
         } else {
+            tts.put("synthesizeToFile", HookStatus.SKIPPED);
+            tts.put("speak", HookStatus.SKIPPED);
+            tts.put("isLanguageAvailable", HookStatus.SKIPPED);
             Log.w(TAG, "Prompt/TTS hooks disabled by configuration");
         }
+        groups.add(tts);
 
-        try {
-            hookActivityOnResume();
-        } catch (Throwable t) {
-            Log.e(TAG, "Failed to install onResume hook", t);
+        // ----- Group: media/asset (AssetManager + Disclosure – silent audio interception) -----
+        GroupResult media = new GroupResult("media");
+        if (ENABLE_PROMPT_TTS_HOOKS) {
+            media.put("assetOpen", hookAssetManagerOpen());
+            media.put("assetOpenFd", hookAssetManagerOpenFd());
+            media.put("disclosure", hookCallRecordingDisclosure(classLoader));
+        } else {
+            media.put("assetOpen", HookStatus.SKIPPED);
+            media.put("assetOpenFd", HookStatus.SKIPPED);
+            media.put("disclosure", HookStatus.SKIPPED);
         }
+        groups.add(media);
 
-        Log.w(TAG, "hook done");
+        // ----- Group: diagnostics (Activity.onResume – version/permission checks) -----
+        GroupResult diagnostics = new GroupResult("diagnostics");
+        diagnostics.put("onResume", hookActivityOnResume());
+        groups.add(diagnostics);
+
+        printStartupSummary(entrypoint, processName, safeProfile, groups);
     }
 }

@@ -10,7 +10,8 @@ This document describes what this module supports today, how release APK variant
 - [4) Country/locale fallback behaviour](#4-countrylocale-fallback-behaviour)
 - [5) What this module does not target](#5-what-this-module-does-not-target)
 - [6) Contributor checklist](#6-contributor-checklist)
-- [7) Related docs](#7-related-docs)
+- [7) Startup summary log](#7-startup-summary-log)
+- [8) Related docs](#8-related-docs)
 
 ## 1) Scope and baseline
 
@@ -77,7 +78,44 @@ When changing compatibility logic:
 3. Re-run/adjust checks in `scripts/verify_silent_mode.sh` when silent-mode behaviour changes.
 4. Update this file only for behaviour that is already implemented in code/workflow.
 
-## 7) Related docs
+## 7) Startup summary log
+
+On every successful hook installation the module emits a structured summary to logcat at `WARN` level under the tag `CallRecording`.  Example:
+
+```text
+W CallRecording: === CallRecording startup ===
+  process=com.google.android.dialer entrypoint=legacy
+  sdk=36 device=tegu model=Pixel 9 Pro
+  mode=SAFE_GLOBAL_ENABLE safeProfile=true conservative=false
+  groups:
+    eligibility{canRecordCall=INSTALLED withinCrosbyGeoFence=INSTALLED isCallRecordingCountry=INSTALLED}
+    locale{getSupportedLocaleFromCountryCode=INSTALLED}
+    tts{synthesizeToFile=INSTALLED speak=INSTALLED isLanguageAvailable=INSTALLED}
+    media{assetOpen=INSTALLED assetOpenFd=INSTALLED disclosure=INSTALLED}
+    diagnostics{onResume=INSTALLED}
+  degraded: none
+=== startup complete ===
+```
+
+### Status values
+
+| Status | Meaning |
+|--------|---------|
+| `INSTALLED` | Hook wired and active. |
+| `SKIPPED` | Intentionally not installed (configuration flag disabled). |
+| `FAILED` | Installation threw an exception; hook is absent. |
+| `AMBIGUOUS` | Multiple Dex targets found; first candidate used (logged as warning). |
+| `OBSERVE_ONLY` | Hook wired but result modifications suppressed (`OBSERVE_ONLY` mode). |
+| `NOT_FOUND` | Target method or class absent in this Dialer build. |
+
+A **degraded** group contains at least one `FAILED`, `NOT_FOUND`, or `AMBIGUOUS` hook.  Degraded eligibility or locale groups are the first thing to check when the Record button is absent.
+
+To capture the summary:
+```bash
+adb logcat -d | grep "CallRecording"
+```
+
+## 8) Related docs
 
 - Project overview and install notes: `README.md`
 - Release automation: `.github/workflows/release.yml`
