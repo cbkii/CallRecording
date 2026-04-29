@@ -3,21 +3,24 @@ package io.github.vvb2060.callrecording.xposed;
 import android.app.Activity;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.content.res.AssetFileDescriptor;
 import android.content.res.AssetManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 import android.util.Log;
-import android.widget.Toast;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.ByteArrayInputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -26,6 +29,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -73,7 +77,7 @@ public class Init implements IXposedHookLoadPackage {
     private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = true;
 
     /** Enable extra debug logging. */
-    private static final boolean ENABLE_VERBOSE_LOGGING = true;
+    private static final boolean ENABLE_VERBOSE_LOGGING = BuildConfig.DEBUG;
 
     /** Enable Android 16+ safe-profile behaviour when the runtime API level is detected. */
     private static final boolean ENABLE_ANDROID16_SAFE_PROFILE = true;
@@ -118,9 +122,13 @@ public class Init implements IXposedHookLoadPackage {
     // Once-only guard for the deferred conservative environment check run from onResume
     private static volatile boolean ranEnvCheck = false;
 
-    // Once-only warning flags to avoid Toast spam
+    // Once-only warning flags to avoid log spam
     private static volatile boolean warnedMissingPermission = false;
     private static volatile boolean warnedUnsupportedVersion = false;
+
+    // Guard against duplicate hook installation (can happen when both legacy and modern
+    // Xposed entrypoints are active simultaneously).
+    private static final AtomicBoolean hooksInstalled = new AtomicBoolean(false);
 
     // -------------------------------------------------------------------------
     // Silent WAV fallback (1 channel, 16-bit PCM, empty audio)
@@ -133,7 +141,10 @@ public class Init implements IXposedHookLoadPackage {
             0, 16, 0, 100, 97, 116, 97, 0, 0, 0, 0};
 
     private static volatile byte[] silentPromptWav;
+    // Cached field looked up by type across the TTS class hierarchy (resilient to field renaming).
     private static volatile Field utteranceListenerField;
+    // Cached temp file used to back AssetFileDescriptor responses for silent audio.
+    private static volatile File silentTempFile;
 
     // -------------------------------------------------------------------------
     // Device / environment helpers
@@ -311,6 +322,125 @@ public class Init implements IXposedHookLoadPackage {
             silentPromptWav = wav;
             Log.w(TAG, "Using built-in silent wav fallback bytes=" + wav.length);
             return silentPromptWav;
+        }
+    }
+
+    /**
+     * Returns a File pre-written with silent WAV bytes, creating and caching it on first call.
+     * Used to back {@link AssetFileDescriptor} responses for silent audio interception.
+     */
+    private static File getSilentTempFile() {
+        File f = silentTempFile;
+        if (f != null && f.exists()) return f;
+        synchronized (Init.class) {
+            f = silentTempFile;
+            if (f != null && f.exists()) return f;
+            try {
+                f = File.createTempFile("silent_disclosure_", ".wav");
+                f.deleteOnExit();
+                try (FileOutputStream fos = new FileOutputStream(f)) {
+                    fos.write(getSilentPromptWavBytes());
+                }
+                silentTempFile = f;
+                return f;
+            } catch (IOException e) {
+                Log.e(TAG, "getSilentTempFile: failed to create temp file", e);
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Returns true when the asset name looks like a call-recording disclosure audio file.
+     * The filename keyword filter is the primary guard; no stack-trace inspection needed.
+     */
+    private static boolean isDisclosureAudioAsset(String name) {
+        if (name == null) return false;
+        String lower = name.toLowerCase(Locale.ROOT);
+        boolean hasKeyword = lower.contains("record")
+                || lower.contains("disclosure")
+                || lower.contains("announcement");
+        boolean hasAudioExt = lower.endsWith(".wav") || lower.endsWith(".ogg")
+                || lower.endsWith(".mp3") || lower.endsWith(".m4a") || lower.endsWith(".aac");
+        return hasKeyword && hasAudioExt;
+    }
+
+    /**
+     * Finds the {@link UtteranceProgressListener} field on the TTS class by type, walking the
+     * class hierarchy. Searching by type is resilient to field renaming across Android versions.
+     */
+    private static Field findUtteranceListenerField(Class<?> ttsClass) {
+        Class<?> c = ttsClass;
+        while (c != null) {
+            for (Field f : c.getDeclaredFields()) {
+                if (UtteranceProgressListener.class.isAssignableFrom(f.getType())) {
+                    try {
+                        f.setAccessible(true);
+                        return f;
+                    } catch (Throwable t) {
+                        Log.w(TAG, "findUtteranceListenerField: setAccessible failed for "
+                                + f.getName(), t);
+                    }
+                }
+            }
+            c = c.getSuperclass();
+        }
+        return null;
+    }
+
+    /**
+     * Retrieves the {@link UtteranceProgressListener} from a live TTS instance.
+     * Caches the field reference for efficiency; falls back gracefully on reflection failure.
+     */
+    private static UtteranceProgressListener getUtteranceProgressListener(Object ttsInstance) {
+        if (ttsInstance == null) return null;
+        Field f = utteranceListenerField;
+        if (f == null) {
+            f = findUtteranceListenerField(ttsInstance.getClass());
+            if (f == null) {
+                Log.w(TAG, "getUtteranceProgressListener: field not found on "
+                        + ttsInstance.getClass().getName());
+                return null;
+            }
+            utteranceListenerField = f;
+        }
+        try {
+            return (UtteranceProgressListener) f.get(ttsInstance);
+        } catch (ReflectiveOperationException e) {
+            Log.w(TAG, "getUtteranceProgressListener: reflection failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * Fires the correct TTS lifecycle sequence — {@code onStart} followed by {@code onDone} —
+     * both posted to the main thread so callers always see a well-ordered callback pair
+     * regardless of which thread triggered the hook.
+     */
+    private static void fireTtsCallbacks(Object ttsInstance, String utteranceId) {
+        if (utteranceId == null) return;
+        UtteranceProgressListener listener = getUtteranceProgressListener(ttsInstance);
+        if (listener == null) return;
+        try {
+            Handler mainHandler = new Handler(Looper.getMainLooper());
+            mainHandler.post(() -> {
+                try {
+                    listener.onStart(utteranceId);
+                } catch (Throwable t) {
+                    Log.w(TAG, "fireTtsCallbacks: onStart failed", t);
+                }
+                // Post onDone after onStart so ordering is guaranteed even when the listener
+                // inspects state synchronously inside onStart.
+                mainHandler.post(() -> {
+                    try {
+                        listener.onDone(utteranceId);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "fireTtsCallbacks: onDone failed", t);
+                    }
+                });
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "fireTtsCallbacks: dispatch failed", t);
         }
     }
 
@@ -539,34 +669,6 @@ public class Init implements IXposedHookLoadPackage {
     // TTS / prompt hooks (staged, side-effect preserving)
     // -------------------------------------------------------------------------
 
-    @SuppressWarnings({"SoonBlockedPrivateApi", "JavaReflectionMemberAccess"})
-    private static void hookDispatchOnInit() {
-        try {
-            Method dispatchOnInit = TextToSpeech.class.getDeclaredMethod("dispatchOnInit",
-                    int.class);
-            XposedBridge.hookMethod(dispatchOnInit, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (ENABLE_VERBOSE_LOGGING) {
-                        Log.d(TAG, "dispatchOnInit: args=" + Arrays.toString(param.args));
-                    }
-                    // Intercept TTS init failures before the listener is notified.
-                    // Mutates args[0] to SUCCESS so Dialer treats TTS as initialised
-                    // even when the engine reported an error.
-                    // Guarded by conservativeMode to avoid overriding in spoofed environments.
-                    if (!conservativeMode
-                            && ENABLE_PROMPT_TTS_HOOKS
-                            && !Objects.equals(param.args[0], TextToSpeech.SUCCESS)) {
-                        param.args[0] = TextToSpeech.SUCCESS;
-                        Log.w(TAG, "dispatchOnInit: TTS init failed, overriding to SUCCESS");
-                    }
-                }
-            });
-        } catch (NoSuchMethodException e) {
-            Log.e(TAG, "dispatchOnInit method not found", e);
-        }
-    }
-
     private static void hookIsLanguageAvailable() {
         try {
             Method isLanguageAvailable = TextToSpeech.class.getDeclaredMethod(
@@ -606,6 +708,17 @@ public class Init implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Hooks {@code TextToSpeech.synthesizeToFile()} with a before-hook that pre-writes a silent
+     * WAV to the target file and skips the original TTS call entirely.
+     *
+     * <p>Using a before-hook rather than checking the return value of the original call (which
+     * only reflects queue success, not synthesis success) ensures the silent file is always
+     * present at the expected path and that no real audio is ever generated.
+     *
+     * <p>Proper {@code onStart}/{@code onDone} lifecycle callbacks are posted to the main thread
+     * so that Dialer state machines that depend on ordered TTS callbacks function correctly.
+     */
     private static void hookSynthesizeToFile() {
         try {
             Method synthesizeToFile = TextToSpeech.class.getDeclaredMethod("synthesizeToFile",
@@ -613,44 +726,25 @@ public class Init implements IXposedHookLoadPackage {
             XposedBridge.hookMethod(synthesizeToFile, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!ENABLE_PROMPT_TTS_HOOKS || !ENABLE_SILENT_PROMPT_FALLBACK) return;
                     if (ENABLE_VERBOSE_LOGGING) {
                         Log.d(TAG, "synthesizeToFile: args=" + Arrays.toString(param.args));
                     }
-                    // Do NOT pre-empty the text here; let TTS attempt genuine synthesis first.
-                }
-
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    if (!ENABLE_PROMPT_TTS_HOOKS) return;
-                    if (Objects.equals(param.getResult(), TextToSpeech.SUCCESS)) return;
-
-                    if (!ENABLE_SILENT_PROMPT_FALLBACK) {
-                        Log.w(TAG, "synthesizeToFile: TTS failed and silent fallback is disabled;"
-                                + " result=" + param.getResult());
-                        return;
-                    }
-
-                    Log.w(TAG, "synthesizeToFile: TTS failed, writing silent wav fallback");
-                    var file = (File) param.args[2];
-                    try (var out = new FileOutputStream(file)) {
+                    File file = (File) param.args[2];
+                    String utteranceId = (String) param.args[3];
+                    // Pre-write the silent WAV before TTS can generate any real audio,
+                    // then skip the original call so no audio synthesis occurs at all.
+                    try (FileOutputStream out = new FileOutputStream(file)) {
                         out.write(getSilentPromptWavBytes());
-                        param.setResult(TextToSpeech.SUCCESS);
                     } catch (IOException e) {
-                        Log.e(TAG, "synthesizeToFile: cannot write " + file, e);
-                        return;
+                        Log.e(TAG, "synthesizeToFile: cannot write silent wav to " + file, e);
+                        return; // Let original proceed if we cannot write the file.
                     }
-                    try {
-                        var field = param.thisObject.getClass()
-                                .getDeclaredField("mUtteranceProgressListener");
-                        field.setAccessible(true);
-                        var listener = (UtteranceProgressListener) field.get(param.thisObject);
-                        if (listener == null) return;
-                        var onDone = UtteranceProgressListener.class.getDeclaredMethod(
-                                "onDone", String.class);
-                        onDone.invoke(listener, (String) param.args[3]);
-                    } catch (ReflectiveOperationException e) {
-                        Log.e(TAG, "synthesizeToFile: cannot invoke onDone", e);
-                    }
+                    param.setResult(TextToSpeech.SUCCESS);
+                    Log.w(TAG, "synthesizeToFile: silent bypass engaged, utteranceId=" + utteranceId);
+                    // Fire onStart then onDone on the main thread to reproduce the expected
+                    // TTS lifecycle ordering without depending on private API.
+                    fireTtsCallbacks(param.thisObject, utteranceId);
                 }
             });
         } catch (NoSuchMethodException e) {
@@ -658,6 +752,14 @@ public class Init implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Hooks {@code TextToSpeech.speak()} with a before-hook that bypasses real TTS when a
+     * call-recording disclosure context is detected.
+     *
+     * <p>Setting the result in the before-hook causes Xposed to skip the original method,
+     * so no real TTS queue entry is created. Proper {@code onStart}/{@code onDone} callbacks
+     * are then posted to the main thread so Dialer state machines advance normally.
+     */
     private static void hookSpeak() {
         try {
             Method speak = TextToSpeech.class.getDeclaredMethod(
@@ -667,24 +769,13 @@ public class Init implements IXposedHookLoadPackage {
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (!ENABLE_PROMPT_TTS_HOOKS || !ENABLE_SILENT_PROMPT_FALLBACK) return;
                     if (!inCallRecordingContext()) return;
-                    param.args[0] = "";
+                    String utteranceId = (String) param.args[3];
+                    // Skip the original speak call so no real TTS queue entry is created.
                     param.setResult(TextToSpeech.SUCCESS);
-                    Log.w(TAG, "speak(CharSequence,int,Bundle,String): silent fallback engaged");
-                    // Fire onDone so callers waiting for utterance callbacks are not stalled.
-                    try {
-                        Field f = utteranceListenerField;
-                        if (f == null) {
-                            f = TextToSpeech.class.getDeclaredField("mUtteranceProgressListener");
-                            f.setAccessible(true);
-                            utteranceListenerField = f;
-                        }
-                        UtteranceProgressListener listener =
-                                (UtteranceProgressListener) f.get(param.thisObject);
-                        if (listener == null) return;
-                        listener.onDone((String) param.args[3]);
-                    } catch (ReflectiveOperationException e) {
-                        Log.e(TAG, "speak: cannot invoke onDone", e);
-                    }
+                    Log.w(TAG, "speak: silent bypass engaged, utteranceId=" + utteranceId);
+                    // Fire onStart then onDone on the main thread to maintain correct
+                    // callback ordering without re-entrancy issues.
+                    fireTtsCallbacks(param.thisObject, utteranceId);
                 }
             });
         } catch (NoSuchMethodException e) {
@@ -726,30 +817,66 @@ public class Init implements IXposedHookLoadPackage {
     }
 
     private static void hookAssetManagerOpen() {
+        // Hook open(String) – the most common asset-open path.
         try {
             Method open = AssetManager.class.getDeclaredMethod("open", String.class);
             XposedBridge.hookMethod(open, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (!ENABLE_SILENT_PROMPT_FALLBACK) return;
-                    String name = (String) param.args[0];
-                    if (name == null) return;
-                    String lower = name.toLowerCase(Locale.ROOT);
-                    if (!lower.contains("record")
-                            && !lower.contains("disclosure")
-                            && !lower.contains("announcement")) {
-                        return;
-                    }
-                    if (!(lower.endsWith(".wav") || lower.endsWith(".ogg") || lower.endsWith(".mp3"))) {
-                        return;
-                    }
-                    if (!inCallRecordingContext()) return;
+                    if (!isDisclosureAudioAsset((String) param.args[0])) return;
                     param.setResult(new ByteArrayInputStream(getSilentPromptWavBytes()));
-                    Log.w(TAG, "AssetManager.open: replaced prompt audio with silent asset: " + name);
+                    Log.w(TAG, "AssetManager.open: replaced prompt audio: " + param.args[0]);
                 }
             });
         } catch (Throwable t) {
-            Log.w(TAG, "AssetManager.open hook unavailable", t);
+            Log.w(TAG, "AssetManager.open(String) hook unavailable", t);
+        }
+        // Hook open(String, int) – access-mode variant used by some callers.
+        try {
+            Method openMode = AssetManager.class.getDeclaredMethod("open", String.class, int.class);
+            XposedBridge.hookMethod(openMode, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!ENABLE_SILENT_PROMPT_FALLBACK) return;
+                    if (!isDisclosureAudioAsset((String) param.args[0])) return;
+                    param.setResult(new ByteArrayInputStream(getSilentPromptWavBytes()));
+                    Log.w(TAG, "AssetManager.open(String,int): replaced prompt audio: " + param.args[0]);
+                }
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "AssetManager.open(String,int) hook unavailable", t);
+        }
+    }
+
+    /**
+     * Hooks {@code AssetManager.openFd(String)} to intercept disclosure audio assets opened as
+     * file descriptors (e.g. when Dialer feeds an {@link AssetFileDescriptor} directly to
+     * {@code MediaPlayer.setDataSource}).
+     */
+    private static void hookAssetManagerOpenFd() {
+        try {
+            Method openFd = AssetManager.class.getDeclaredMethod("openFd", String.class);
+            XposedBridge.hookMethod(openFd, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!ENABLE_SILENT_PROMPT_FALLBACK) return;
+                    if (!isDisclosureAudioAsset((String) param.args[0])) return;
+                    File tmp = getSilentTempFile();
+                    if (tmp == null) return;
+                    try {
+                        ParcelFileDescriptor pfd = ParcelFileDescriptor.open(
+                                tmp, ParcelFileDescriptor.MODE_READ_ONLY);
+                        param.setResult(new AssetFileDescriptor(pfd, 0, tmp.length()));
+                        Log.w(TAG, "AssetManager.openFd: replaced prompt audio: " + param.args[0]);
+                    } catch (IOException e) {
+                        Log.w(TAG, "AssetManager.openFd: silent replacement failed for: "
+                                + param.args[0], e);
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "AssetManager.openFd hook unavailable", t);
         }
     }
 
@@ -793,9 +920,6 @@ public class Init implements IXposedHookLoadPackage {
                     != PackageManager.PERMISSION_GRANTED) {
                 if (!warnedMissingPermission) {
                     warnedMissingPermission = true;
-                    Toast.makeText(context,
-                            "CallRecording: Missing CAPTURE_AUDIO_OUTPUT permission",
-                            Toast.LENGTH_LONG).show();
                     Log.w(TAG, "Missing CAPTURE_AUDIO_OUTPUT permission");
                 }
                 return;
@@ -816,9 +940,6 @@ public class Init implements IXposedHookLoadPackage {
             if (versionName != null && versionName.endsWith("downloadable")) {
                 if (!warnedUnsupportedVersion) {
                     warnedUnsupportedVersion = true;
-                    Toast.makeText(context,
-                            "CallRecording: Unsupported version, please use full version.",
-                            Toast.LENGTH_LONG).show();
                     Log.w(TAG, "Unsupported version detected: " + versionName);
                 }
             }
@@ -838,6 +959,22 @@ public class Init implements IXposedHookLoadPackage {
 
     static void handleDialerPackageLoad(String packageName, String processName, ClassLoader classLoader) {
         if (!"com.google.android.dialer".equals(packageName)) return;
+
+        // Only install hooks in the main Dialer process. Sub-processes (e.g. ":remote", ":ui")
+        // may not have the target classes loaded and hooking them causes unnecessary overhead.
+        if (!packageName.equals(processName)) {
+            Log.w(TAG, "Skipping non-main Dialer process: " + processName);
+            return;
+        }
+
+        // Guard against duplicate hook installation when both legacy and modern Xposed
+        // entrypoints are active at the same time in the same process.
+        if (!hooksInstalled.compareAndSet(false, true)) {
+            Log.w(TAG, "Hooks already installed; skipping duplicate entry for process="
+                    + processName);
+            return;
+        }
+
         if (!BuildConfig.DEBUG && !ENABLE_SILENT_PROMPT_FALLBACK) {
             throw new IllegalStateException("Release builds must keep ENABLE_SILENT_PROMPT_FALLBACK=true");
         }
@@ -904,11 +1041,6 @@ public class Init implements IXposedHookLoadPackage {
                 Log.e(TAG, "Failed to install speak hook", t);
             }
             try {
-                hookDispatchOnInit();
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to install dispatchOnInit hook", t);
-            }
-            try {
                 hookIsLanguageAvailable();
             } catch (Throwable t) {
                 Log.e(TAG, "Failed to install isLanguageAvailable hook", t);
@@ -917,6 +1049,11 @@ public class Init implements IXposedHookLoadPackage {
                 hookAssetManagerOpen();
             } catch (Throwable t) {
                 Log.e(TAG, "Failed to install AssetManager.open hook", t);
+            }
+            try {
+                hookAssetManagerOpenFd();
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to install AssetManager.openFd hook", t);
             }
             try {
                 hookCallRecordingDisclosure(classLoader);
