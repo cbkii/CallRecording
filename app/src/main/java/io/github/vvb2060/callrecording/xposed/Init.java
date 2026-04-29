@@ -9,6 +9,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.media.MediaPlayer;
 import android.os.ParcelFileDescriptor;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
@@ -141,7 +142,10 @@ public class Init implements IXposedHookLoadPackage {
         Log.d(TAG, "inCallRecordingSession: cleared");
     };
 
-    // Seconds to keep the session flag set after the last synthesizeToFile interception.
+    // How long to keep the session flag set after the last synthesizeToFile interception.
+    // 15 seconds is a comfortable upper bound for the TTS→onDone→play sequence in Dialer:
+    // the entire disclosure interaction (synthesis + playback) typically completes within
+    // 1–3 s, so 15 s provides ample async margin without risk of suppressing unrelated TTS.
     private static final long RECORDING_SESSION_TIMEOUT_MS = 15_000;
 
     // Cached main-thread Handler. Lazily initialised; null until first use.
@@ -390,6 +394,8 @@ public class Init implements IXposedHookLoadPackage {
         Class<?> c = ttsClass;
         while (c != null) {
             for (Field f : c.getDeclaredFields()) {
+                // isAssignableFrom(f.getType()) returns true when f.getType() IS
+                // UtteranceProgressListener or a subclass of it — the direction we want.
                 if (UtteranceProgressListener.class.isAssignableFrom(f.getType())) {
                     try {
                         f.setAccessible(true);
@@ -471,6 +477,8 @@ public class Init implements IXposedHookLoadPackage {
         Looper looper = Looper.getMainLooper();
         if (looper == null) return null;
         synchronized (Init.class) {
+            // Re-check inside the lock; another thread may have initialised it between the
+            // first null check above and the lock acquisition.
             if (mainHandler == null) {
                 mainHandler = new Handler(looper);
             }
@@ -797,7 +805,11 @@ public class Init implements IXposedHookLoadPackage {
                     // Ensure the target directory exists so FileOutputStream does not throw.
                     File parent = file.getParentFile();
                     if (parent != null && !parent.exists()) {
-                        parent.mkdirs();
+                        if (!parent.mkdirs()) {
+                            Log.w(TAG, "synthesizeToFile: mkdirs failed for " + parent
+                                    + " — FileOutputStream may still succeed if dir was created"
+                                    + " concurrently; will attempt write anyway");
+                        }
                     }
                     String utteranceId = (String) param.args[3];
                     // Mark the recording session active so hookSpeak can suppress async callbacks.
@@ -904,11 +916,12 @@ public class Init implements IXposedHookLoadPackage {
             }
         }
         // Fallback: walk all declared fields in the class hierarchy and mute any
-        // android.media.MediaPlayer instance found.  This survives field renaming.
+        // android.media.MediaPlayer instance found.  Using type assignability rather than
+        // string comparison is robust across ClassLoader contexts.
         Class<?> c = disclosure.getClass();
         while (c != null && !c.equals(Object.class)) {
             for (Field f : c.getDeclaredFields()) {
-                if (!f.getType().getName().equals("android.media.MediaPlayer")) continue;
+                if (!MediaPlayer.class.isAssignableFrom(f.getType())) continue;
                 try {
                     f.setAccessible(true);
                     Object player = f.get(disclosure);
