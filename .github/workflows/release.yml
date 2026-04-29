@@ -1,4 +1,4 @@
-name: release APK variants
+name: Manual Release APK Variants
 
 on:
   workflow_dispatch:
@@ -45,9 +45,14 @@ on:
         required: false
         type: boolean
         default: true
+      target_ref:
+        description: "Branch, tag, or SHA to release from (manual trigger safety)."
+        required: false
+        default: "main"
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Scope concurrency by workflow + selected ref so manual runs do not collide unexpectedly.
+  group: release-${{ github.repository }}-${{ github.workflow }}-${{ inputs.target_ref || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -64,6 +69,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.target_ref || github.ref_name }}
+
+      - name: Validate selected source ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          REQUESTED_REF="${{ inputs.target_ref || github.ref_name }}"
+          RESOLVED_SHA="$(git rev-parse HEAD)"
+          echo "Manual release source ref: $REQUESTED_REF"
+          echo "Manual release source SHA: $RESOLVED_SHA"
 
       - name: Resolve release metadata
         id: meta
@@ -261,38 +276,38 @@ jobs:
             local mode="$1"
             local output_name="$2"
             python - "$mode" "$INIT_FILE" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-mode = sys.argv[1]
-path = Path(sys.argv[2])
-source = path.read_text()
-
-source = re.sub(
-    r'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode\.[A-Z_]+;',
-    f'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode.{mode};',
-    source,
-    count=1,
-)
-
-# Primary release must keep all silent-mode features enabled.
-if mode == "SAFE_GLOBAL_ENABLE":
-    source = re.sub(
-        r'private static final boolean ENABLE_PROMPT_TTS_HOOKS = (true|false);',
-        'private static final boolean ENABLE_PROMPT_TTS_HOOKS = true;',
-        source,
-        count=1,
-    )
-    source = re.sub(
-        r'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = (true|false);',
-        'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = true;',
-        source,
-        count=1,
-    )
-
-path.write_text(source)
-PY
+          import re
+          import sys
+          from pathlib import Path
+          
+          mode = sys.argv[1]
+          path = Path(sys.argv[2])
+          source = path.read_text()
+          
+          source = re.sub(
+              r'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode\.[A-Z_]+;',
+              f'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode.{mode};',
+              source,
+              count=1,
+          )
+          
+          # Primary release must keep all silent-mode features enabled.
+          if mode == "SAFE_GLOBAL_ENABLE":
+              source = re.sub(
+                  r'private static final boolean ENABLE_PROMPT_TTS_HOOKS = (true|false);',
+                  'private static final boolean ENABLE_PROMPT_TTS_HOOKS = true;',
+                  source,
+                  count=1,
+              )
+              source = re.sub(
+                  r'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = (true|false);',
+                  'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = true;',
+                  source,
+                  count=1,
+              )
+          
+          path.write_text(source)
+          PY
 
             ./gradlew --no-daemon assembleRelease
             APK_PATH="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' | sort | head -n 1)"
