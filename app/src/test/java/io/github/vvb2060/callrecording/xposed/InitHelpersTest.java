@@ -215,7 +215,7 @@ public class InitHelpersTest {
     }
 
     @Test
-    public void groupResult_noDegraationOnSkipped() {
+    public void groupResult_noDegradationOnSkipped() {
         Init.GroupResult g = new Init.GroupResult("test");
         g.put("h1", Init.HookStatus.SKIPPED);
         assertFalse(g.hasDegradation());
