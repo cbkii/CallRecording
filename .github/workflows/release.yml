@@ -1,4 +1,4 @@
-name: Release APK
+name: release APK variants
 
 on:
   workflow_dispatch:
@@ -7,6 +7,15 @@ on:
         description: "Git tag / GitHub Release tag to create. Leave blank to use versionName from app/build.gradle.kts."
         required: false
         default: ""
+      version:
+        description: "Version value (e.g. 2.1.0). Used when tag is empty; ignored if tag is explicitly set."
+        required: false
+        default: ""
+      auto_bump:
+        description: "Automatically bump patch version when tag/version already exists (recommended default)."
+        required: false
+        type: boolean
+        default: true
       name:
         description: "GitHub Release title. Leave blank to use the resolved tag."
         required: false
@@ -21,6 +30,21 @@ on:
         required: false
         type: boolean
         default: false
+      include_safe_global_enable:
+        description: "Include SAFE_GLOBAL_ENABLE variant (primary)"
+        required: false
+        type: boolean
+        default: true
+      include_force_legacy_us:
+        description: "Include FORCE_LEGACY_US variant"
+        required: false
+        type: boolean
+        default: true
+      include_observe_only:
+        description: "Include OBSERVE_ONLY variant"
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: release-${{ github.ref }}
@@ -59,9 +83,11 @@ jobs:
           sanitize_name() { printf '%s' "$1" | tr -d '\n\r' | tr -cd '[:print:]'; }
 
           SAFE_TAG="$(sanitize_tag "${{ inputs.tag || '' }}")"
+          SAFE_VERSION="$(sanitize_tag "${{ inputs.version || '' }}")"
           SAFE_NAME="$(sanitize_name "${{ inputs.name || '' }}")"
 
-          TAG="${SAFE_TAG:-$VERSION_NAME}"
+          BASE_TAG="${SAFE_TAG:-${SAFE_VERSION:-$VERSION_NAME}}"
+          TAG="$BASE_TAG"
 
           bump_patch() {
             local tag="$1" prefix="" ver
@@ -73,11 +99,16 @@ jobs:
             fi
           }
 
-          while git rev-parse -q --verify "refs/tags/$TAG" > /dev/null 2>&1; do
-            BUMPED="$(bump_patch "$TAG")"
-            echo "Tag $TAG already exists, auto-bumping to $BUMPED"
-            TAG="$BUMPED"
-          done
+          if [ "${{ inputs.auto_bump }}" = "true" ]; then
+            while git rev-parse -q --verify "refs/tags/$TAG" > /dev/null 2>&1; do
+              BUMPED="$(bump_patch "$TAG")"
+              echo "Tag $TAG already exists, auto-bumping to $BUMPED"
+              TAG="$BUMPED"
+            done
+          elif git rev-parse -q --verify "refs/tags/$TAG" > /dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists and auto_bump=false. Choose another tag/version or enable auto bump."
+            exit 1
+          fi
 
           RELEASE_NAME="${SAFE_NAME:-$TAG}"
           APP_VERSION="${TAG#v}"
@@ -105,6 +136,7 @@ jobs:
           echo "Release tag: $TAG"
           echo "Release app version: $APP_VERSION"
           echo "Release title: $RELEASE_NAME"
+          echo "Requested base tag/version: $BASE_TAG"
           echo "Previous release tag: ${PREV_TAG:-<none>}"
 
       - name: Apply resolved release version to codebase
@@ -272,20 +304,45 @@ PY
 
           ./gradlew --no-daemon clean
 
+          VARIANT_FILES=()
+          SELECTED_VARIANTS=0
           PRIMARY_APK='${{ steps.meta.outputs.apk_basename }}'
-          build_mode_apk "SAFE_GLOBAL_ENABLE" "$PRIMARY_APK"
 
-          VARIANT_FILES=("$PRIMARY_APK" "${PRIMARY_APK}.sha256")
-          for mode in FORCE_LEGACY_US OBSERVE_ONLY; do
-            MODE_SUFFIX="$(variant_suffix "$mode")"
-            APK_NAME="callrecording-${{ steps.meta.outputs.tag }}-${MODE_SUFFIX}.apk"
-            build_mode_apk "$mode" "$APK_NAME"
+          if [ "${{ inputs.include_safe_global_enable }}" = "true" ]; then
+            build_mode_apk "SAFE_GLOBAL_ENABLE" "$PRIMARY_APK"
+            VARIANT_FILES+=("$PRIMARY_APK" "${PRIMARY_APK}.sha256")
+            SELECTED_VARIANTS=$((SELECTED_VARIANTS + 1))
+          fi
+
+          if [ "${{ inputs.include_force_legacy_us }}" = "true" ]; then
+            APK_NAME="callrecording-${{ steps.meta.outputs.tag }}-$(variant_suffix FORCE_LEGACY_US).apk"
+            build_mode_apk "FORCE_LEGACY_US" "$APK_NAME"
             VARIANT_FILES+=("$APK_NAME" "${APK_NAME}.sha256")
-          done
+            SELECTED_VARIANTS=$((SELECTED_VARIANTS + 1))
+          fi
+
+          if [ "${{ inputs.include_observe_only }}" = "true" ]; then
+            APK_NAME="callrecording-${{ steps.meta.outputs.tag }}-$(variant_suffix OBSERVE_ONLY).apk"
+            build_mode_apk "OBSERVE_ONLY" "$APK_NAME"
+            VARIANT_FILES+=("$APK_NAME" "${APK_NAME}.sha256")
+            SELECTED_VARIANTS=$((SELECTED_VARIANTS + 1))
+          fi
+
+          if [ "$SELECTED_VARIANTS" -eq 0 ]; then
+            echo "::error::No variant selected. Enable at least one include_* input."
+            exit 1
+          fi
 
           {
-            echo "release_apk=$PRIMARY_APK"
-            echo "release_sha256=${PRIMARY_APK}.sha256"
+            if [ "${{ inputs.include_safe_global_enable }}" = "true" ]; then
+              echo "release_apk=$PRIMARY_APK"
+              echo "release_sha256=${PRIMARY_APK}.sha256"
+            else
+              FIRST_APK="$(printf '%s\n' "${VARIANT_FILES[@]}" | grep '\.apk$' | head -n 1)"
+              FIRST_SHA="${FIRST_APK}.sha256"
+              echo "release_apk=$FIRST_APK"
+              echo "release_sha256=$FIRST_SHA"
+            fi
             echo "release_files<<EOF"
             for f in "${VARIANT_FILES[@]}"; do
               echo "$f"
