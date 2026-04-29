@@ -10,7 +10,8 @@ This document describes what this module supports today, how release APK variant
 - [4) Country/locale fallback behaviour](#4-countrylocale-fallback-behaviour)
 - [5) What this module does not target](#5-what-this-module-does-not-target)
 - [6) Contributor checklist](#6-contributor-checklist)
-- [7) Related docs](#7-related-docs)
+- [7) Startup summary log](#7-startup-summary-log)
+- [8) Related docs](#8-related-docs)
 
 ## 1) Scope and baseline
 
@@ -81,7 +82,7 @@ When changing compatibility logic:
 
 On every successful hook installation the module emits a structured summary to logcat at `WARN` level under the tag `CallRecording`.  Example:
 
-```
+```text
 W CallRecording: === CallRecording startup ===
   process=com.google.android.dialer entrypoint=legacy
   sdk=36 device=tegu model=Pixel 9 Pro

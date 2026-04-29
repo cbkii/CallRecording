@@ -212,6 +212,9 @@ public class Init implements IXposedHookLoadPackage {
     // Runnable used to clear the session flag after a grace period.
     private static final Runnable clearCallRecordingSession = () -> {
         inCallRecordingSession = false;
+        // Also clear any utteranceId entries that were recorded in this session
+        // so they can be legitimately dispatched if reused in a future session.
+        completedUtteranceIds.clear();
         Log.d(TAG, "inCallRecordingSession: cleared");
     };
 
@@ -515,17 +518,18 @@ public class Init implements IXposedHookLoadPackage {
      */
     private static void fireTtsCallbacks(Object ttsInstance, String utteranceId) {
         if (utteranceId == null) return;
-        // Prevent duplicate onStart/onDone delivery for the same utteranceId.
-        if (!completedUtteranceIds.add(utteranceId)) {
-            Log.d(TAG, "fireTtsCallbacks: already completed utteranceId=" + utteranceId
-                    + ", skipping duplicate");
-            return;
-        }
         UtteranceProgressListener listener = getUtteranceProgressListener(ttsInstance);
         if (listener == null) return;
         Handler h = getMainHandler();
         if (h == null) {
             Log.w(TAG, "fireTtsCallbacks: main looper unavailable, cannot dispatch callbacks");
+            return;
+        }
+        // Only mark the utteranceId as completed after we've confirmed both the listener and
+        // handler exist — preventing permanent suppression when dispatch was never possible.
+        if (!completedUtteranceIds.add(utteranceId)) {
+            Log.d(TAG, "fireTtsCallbacks: already completed utteranceId=" + utteranceId
+                    + ", skipping duplicate");
             return;
         }
         h.post(() -> {
