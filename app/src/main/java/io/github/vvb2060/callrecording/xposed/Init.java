@@ -130,6 +130,23 @@ public class Init implements IXposedHookLoadPackage {
     // Xposed entrypoints are active simultaneously).
     private static final AtomicBoolean hooksInstalled = new AtomicBoolean(false);
 
+    // Tracks whether a synthesizeToFile call was recently intercepted so that speak() hooks
+    // can suppress TTS callbacks that arrive asynchronously (after the recording-context
+    // class names have left the call stack).
+    private static volatile boolean inCallRecordingSession = false;
+
+    // Runnable used to clear the session flag after a grace period.
+    private static final Runnable clearCallRecordingSession = () -> {
+        inCallRecordingSession = false;
+        Log.d(TAG, "inCallRecordingSession: cleared");
+    };
+
+    // Seconds to keep the session flag set after the last synthesizeToFile interception.
+    private static final long RECORDING_SESSION_TIMEOUT_MS = 15_000;
+
+    // Cached main-thread Handler. Lazily initialised; null until first use.
+    private static volatile Handler mainHandler;
+
     // -------------------------------------------------------------------------
     // Silent WAV fallback (1 channel, 16-bit PCM, empty audio)
     // -------------------------------------------------------------------------
@@ -421,26 +438,57 @@ public class Init implements IXposedHookLoadPackage {
         if (utteranceId == null) return;
         UtteranceProgressListener listener = getUtteranceProgressListener(ttsInstance);
         if (listener == null) return;
-        try {
-            Handler mainHandler = new Handler(Looper.getMainLooper());
-            mainHandler.post(() -> {
+        Handler h = getMainHandler();
+        if (h == null) {
+            Log.w(TAG, "fireTtsCallbacks: main looper unavailable, cannot dispatch callbacks");
+            return;
+        }
+        h.post(() -> {
+            try {
+                listener.onStart(utteranceId);
+            } catch (Throwable t) {
+                Log.w(TAG, "fireTtsCallbacks: onStart failed", t);
+            }
+            // Post onDone after onStart so ordering is guaranteed even when the listener
+            // inspects state synchronously inside onStart.
+            h.post(() -> {
                 try {
-                    listener.onStart(utteranceId);
+                    listener.onDone(utteranceId);
                 } catch (Throwable t) {
-                    Log.w(TAG, "fireTtsCallbacks: onStart failed", t);
+                    Log.w(TAG, "fireTtsCallbacks: onDone failed", t);
                 }
-                // Post onDone after onStart so ordering is guaranteed even when the listener
-                // inspects state synchronously inside onStart.
-                mainHandler.post(() -> {
-                    try {
-                        listener.onDone(utteranceId);
-                    } catch (Throwable t) {
-                        Log.w(TAG, "fireTtsCallbacks: onDone failed", t);
-                    }
-                });
             });
-        } catch (Throwable t) {
-            Log.w(TAG, "fireTtsCallbacks: dispatch failed", t);
+        });
+    }
+
+    /**
+     * Returns a cached {@link Handler} bound to the main Looper, or {@code null} if the main
+     * Looper is not yet available (e.g. very early in process startup).
+     */
+    private static Handler getMainHandler() {
+        Handler h = mainHandler;
+        if (h != null) return h;
+        Looper looper = Looper.getMainLooper();
+        if (looper == null) return null;
+        synchronized (Init.class) {
+            if (mainHandler == null) {
+                mainHandler = new Handler(looper);
+            }
+            return mainHandler;
+        }
+    }
+
+    /**
+     * Marks a call-recording TTS session as active and schedules automatic expiry.
+     * Used to extend the suppression window for {@code speak()} calls that arrive
+     * asynchronously after the recording-context class names have left the call stack.
+     */
+    private static void markCallRecordingSessionActive() {
+        inCallRecordingSession = true;
+        Handler h = getMainHandler();
+        if (h != null) {
+            h.removeCallbacks(clearCallRecordingSession);
+            h.postDelayed(clearCallRecordingSession, RECORDING_SESSION_TIMEOUT_MS);
         }
     }
 
@@ -718,6 +766,10 @@ public class Init implements IXposedHookLoadPackage {
      *
      * <p>Proper {@code onStart}/{@code onDone} lifecycle callbacks are posted to the main thread
      * so that Dialer state machines that depend on ordered TTS callbacks function correctly.
+     *
+     * <p>Also marks the call-recording session active so that any subsequent {@code speak()}
+     * calls within the session window are also suppressed, even from async threads that no
+     * longer carry the recording-context class names in their stack traces.
      */
     private static void hookSynthesizeToFile() {
         try {
@@ -727,11 +779,29 @@ public class Init implements IXposedHookLoadPackage {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (!ENABLE_PROMPT_TTS_HOOKS || !ENABLE_SILENT_PROMPT_FALLBACK) return;
+                    if (MODE == RecordingCompatibilityMode.OBSERVE_ONLY) {
+                        if (ENABLE_VERBOSE_LOGGING) {
+                            Log.d(TAG, "synthesizeToFile: OBSERVE_ONLY, not intercepting; args="
+                                    + Arrays.toString(param.args));
+                        }
+                        return;
+                    }
                     if (ENABLE_VERBOSE_LOGGING) {
                         Log.d(TAG, "synthesizeToFile: args=" + Arrays.toString(param.args));
                     }
                     File file = (File) param.args[2];
+                    if (file == null) {
+                        Log.w(TAG, "synthesizeToFile: file argument is null, skipping silent bypass");
+                        return;
+                    }
+                    // Ensure the target directory exists so FileOutputStream does not throw.
+                    File parent = file.getParentFile();
+                    if (parent != null && !parent.exists()) {
+                        parent.mkdirs();
+                    }
                     String utteranceId = (String) param.args[3];
+                    // Mark the recording session active so hookSpeak can suppress async callbacks.
+                    markCallRecordingSessionActive();
                     // Pre-write the silent WAV before TTS can generate any real audio,
                     // then skip the original call so no audio synthesis occurs at all.
                     try (FileOutputStream out = new FileOutputStream(file)) {
@@ -756,6 +826,15 @@ public class Init implements IXposedHookLoadPackage {
      * Hooks {@code TextToSpeech.speak()} with a before-hook that bypasses real TTS when a
      * call-recording disclosure context is detected.
      *
+     * <p>Context is determined by two complementary methods:
+     * <ol>
+     *   <li>{@link #inCallRecordingContext()} — synchronous stack-trace check; reliable when
+     *       {@code speak()} is called directly from recording code.</li>
+     *   <li>{@link #inCallRecordingSession} — flag set by {@link #hookSynthesizeToFile}; remains
+     *       active for {@value #RECORDING_SESSION_TIMEOUT_MS} ms, covering async callbacks that
+     *       have lost the recording-context class names from their stack traces.</li>
+     * </ol>
+     *
      * <p>Setting the result in the before-hook causes Xposed to skip the original method,
      * so no real TTS queue entry is created. Proper {@code onStart}/{@code onDone} callbacks
      * are then posted to the main thread so Dialer state machines advance normally.
@@ -768,11 +847,21 @@ public class Init implements IXposedHookLoadPackage {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (!ENABLE_PROMPT_TTS_HOOKS || !ENABLE_SILENT_PROMPT_FALLBACK) return;
-                    if (!inCallRecordingContext()) return;
+                    if (MODE == RecordingCompatibilityMode.OBSERVE_ONLY) {
+                        if (ENABLE_VERBOSE_LOGGING) {
+                            Log.d(TAG, "speak: OBSERVE_ONLY, not intercepting");
+                        }
+                        return;
+                    }
+                    // Accept suppression if either the live stack trace contains recording class
+                    // names OR the session flag was set by a recent synthesizeToFile interception.
+                    if (!inCallRecordingSession && !inCallRecordingContext()) return;
                     String utteranceId = (String) param.args[3];
                     // Skip the original speak call so no real TTS queue entry is created.
                     param.setResult(TextToSpeech.SUCCESS);
-                    Log.w(TAG, "speak: silent bypass engaged, utteranceId=" + utteranceId);
+                    Log.w(TAG, "speak: silent bypass engaged"
+                            + " session=" + inCallRecordingSession
+                            + " utteranceId=" + utteranceId);
                     // Fire onStart then onDone on the main thread to maintain correct
                     // callback ordering without re-entrancy issues.
                     fireTtsCallbacks(param.thisObject, utteranceId);
@@ -802,18 +891,41 @@ public class Init implements IXposedHookLoadPackage {
 
     private static void setDisclosurePlayerSilent(Object disclosure) {
         if (!ENABLE_SILENT_PROMPT_FALLBACK || disclosure == null) return;
+        // Try well-known field names first (fast path).
         for (String fieldName : new String[]{"mMediaPlayer", "mediaPlayer", "player"}) {
             try {
                 Object player = XposedHelpers.getObjectField(disclosure, fieldName);
                 if (player != null) {
                     XposedHelpers.callMethod(player, "setVolume", 0f, 0f);
-                    Log.w(TAG, "Recording: Silent mode active (player muted via " + fieldName
-                            + ")");
+                    Log.w(TAG, "Recording: disclosure player muted via field: " + fieldName);
                     return;
                 }
             } catch (Throwable ignored) {
             }
         }
+        // Fallback: walk all declared fields in the class hierarchy and mute any
+        // android.media.MediaPlayer instance found.  This survives field renaming.
+        Class<?> c = disclosure.getClass();
+        while (c != null && !c.equals(Object.class)) {
+            for (Field f : c.getDeclaredFields()) {
+                if (!f.getType().getName().equals("android.media.MediaPlayer")) continue;
+                try {
+                    f.setAccessible(true);
+                    Object player = f.get(disclosure);
+                    if (player != null) {
+                        XposedHelpers.callMethod(player, "setVolume", 0f, 0f);
+                        Log.w(TAG, "Recording: disclosure player muted via scanned field: "
+                                + f.getName());
+                        return;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            c = c.getSuperclass();
+        }
+        // Player not yet assigned at construction time — the AssetManager hooks will
+        // ensure any audio file opened later contains only silence.
+        Log.d(TAG, "setDisclosurePlayerSilent: no player found at construction time");
     }
 
     private static void hookAssetManagerOpen() {
