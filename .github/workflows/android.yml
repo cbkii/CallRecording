@@ -33,6 +33,11 @@ jobs:
           echo 'android.native.buildOutput=verbose' >> gradle.properties
           echo 'android.includeDependencyInfoInApks=false' >> gradle.properties
           ./gradlew assemble
+      - name: Run unit tests
+        run: ./gradlew test
+      - name: Validate debug APK packaging (Linux only)
+        if: runner.os == 'Linux'
+        run: bash scripts/validate_apk.sh app/build/outputs/apk/debug/app-debug.apk
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
