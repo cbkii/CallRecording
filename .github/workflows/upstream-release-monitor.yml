@@ -112,7 +112,8 @@ jobs:
           if [ -f "$RESOLVED_TAGS_FILE" ]; then
             while IFS= read -r raw || [ -n "$raw" ]; do
               line="${raw%%#*}"
-              line="$(xargs <<<"${line}")"
+              line="${line#"${line%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
               [ -n "$line" ] || continue
               if [[ "$line" == *"@"* ]]; then
                 if [[ "$line" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+@[A-Za-z0-9._./+-]+$ ]] && [ "$line" = "${UPSTREAM_REPO}@${TAG}" ]; then

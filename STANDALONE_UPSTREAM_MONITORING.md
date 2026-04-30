@@ -8,7 +8,7 @@
 
 ### Must change to current repo context
 - Workflow compare links for upstream monitoring now explicitly generate compare URLs with `${{ github.repository }}` context (this repository), not fork-network assumptions.
-- README now points default release navigation to this repository's Releases page (`../../releases`).
+- README now points default release navigation to this repository's Releases page (`./releases`).
 
 ### Keep as-is for compatibility
 - Java package / namespace identifiers remain `io.github.vvb2060.callrecording` in Gradle and source paths.

@@ -78,7 +78,7 @@ Do not add scope for unrelated packages (for example `android`, `system_server`,
 - Silent-mode verification script: [`scripts/verify_silent_mode.sh`](./scripts/verify_silent_mode.sh)
 
 ## Releases and changelog
-- Releases for this standalone repository: [GitHub Releases](../../releases)
+- Releases for this standalone repository: [GitHub Releases](./releases)
 - Pull requests and commit comparisons should use this repository context by default (not fork-network compare pages).
 
 ## Upstream provenance and attribution
