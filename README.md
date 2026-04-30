@@ -76,3 +76,27 @@ Do not add scope for unrelated packages (for example `android`, `system_server`,
 ## More technical docs
 - Compatibility details and CLI diagnostics: [COMPATIBILITY.md](./COMPATIBILITY.md)
 - Silent-mode verification script: [`scripts/verify_silent_mode.sh`](./scripts/verify_silent_mode.sh)
+
+## Releases and changelog
+- Releases for this standalone repository: [GitHub Releases](./releases)
+- Pull requests and commit comparisons should use this repository context by default (not fork-network compare pages).
+
+## Upstream provenance and attribution
+This project is a **standalone continuation** of work originally published at **`vvb2060/CallRecording`**:
+- Original upstream repository: <https://github.com/vvb2060/CallRecording>
+- Upstream contributors: <https://github.com/vvb2060/CallRecording/graphs/contributors>
+
+Attribution principles for this repository:
+1. Credit the original project and contributors clearly.
+2. Do not imply automatic fork-network syncing when none is configured.
+3. Distinguish historical provenance from current maintenance ownership here.
+4. Monitor upstream changes via issue-based triage using `.github/workflows/upstream-release-monitor.yml`.
+
+Upstream changes are reviewed manually; there is no auto-merge or automatic sync.
+
+### Upstream monitor operations (maintainers)
+- **Triggers**: daily schedule plus manual `workflow_dispatch`.
+- **Manual controls**: optional `upstream_repo`, `upstream_tag`, `include_prerelease`, and `force=true` for bypassing suppression rules.
+- **Suppression behavior**: monitor skips when a tag is resolved, already integrated, unchanged from previous open issue fingerprint, or already closed for the same tag.
+- **Resolution workflow**: after triage, add `tag` or `owner/repo@tag` to `.github/upstream-release-resolved-tags.txt` and close the issue.
+- **Intentional skips**: summary output explains why no issue was created/updated.

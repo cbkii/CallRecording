@@ -1,0 +1,15 @@
+# Upstream release tags already triaged/resolved for monitor suppression.
+#
+# Accepted entries (one per line):
+#   1) <tag>                    e.g. v1.2.3
+#   2) <owner>/<repo>@<tag>     e.g. vvb2060/CallRecording@v1.2.3
+#
+# Rules:
+# - Exact match only.
+# - Blank lines and lines starting with # are ignored.
+# - Inline comments are allowed after #.
+# - Malformed lines are ignored safely.
+#
+# Maintenance:
+# - Add a line when triage is done and no further issue is needed for that tag.
+# - Remove a line to re-enable issue tracking for that tag.
