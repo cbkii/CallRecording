@@ -80,12 +80,19 @@ jobs:
         run: |
           set -euo pipefail
           REQUESTED_REF="${{ inputs.target_ref || github.ref_name }}"
+          push_ref=""
           if git show-ref --verify --quiet "refs/remotes/origin/${REQUESTED_REF}"; then
-            echo "push_ref=$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+            # Remote branch — version-bump commits can be pushed back.
+            push_ref="$REQUESTED_REF"
+          elif git show-ref --verify --quiet "refs/tags/${REQUESTED_REF}"; then
+            echo "Note: target_ref is a tag; version-bump commits will not be pushed back."
+          elif git rev-parse --verify --quiet "${REQUESTED_REF}^{commit}" > /dev/null 2>&1; then
+            echo "Note: target_ref resolved as a commit SHA; version-bump commits will not be pushed back."
           else
-            echo "::error::target_ref must be a branch for this workflow because it commits and pushes versionName."
+            echo "::error::Could not resolve target_ref '${REQUESTED_REF}' as a branch, tag, or SHA."
             exit 1
           fi
+          echo "push_ref=${push_ref}" >> "$GITHUB_OUTPUT"
           RESOLVED_SHA="$(git rev-parse HEAD)"
           echo "Manual release source ref: $REQUESTED_REF"
           echo "Manual release source SHA: $RESOLVED_SHA"
@@ -167,6 +174,8 @@ jobs:
       - name: Apply resolved release version to codebase
         id: sync_version
         shell: bash
+        env:
+          PUSH_REF: ${{ steps.source_ref.outputs.push_ref }}
         run: |
           set -euo pipefail
 
@@ -177,6 +186,10 @@ jobs:
           [ -n "$CURRENT_VERSION" ] || { echo "::error::Could not parse current versionName from app/build.gradle.kts"; exit 1; }
 
           if [ "$CURRENT_VERSION" != "$TARGET_VERSION" ]; then
+            if [ -z "$PUSH_REF" ]; then
+              echo "::error::Version bump required (${CURRENT_VERSION} → ${TARGET_VERSION}) but target_ref is a tag or SHA; cannot push the update. Use a branch as target_ref or ensure versionName already matches the resolved release version."
+              exit 1
+            fi
             sed -i "s/^\([[:space:]]*versionName[[:space:]]*=[[:space:]]*\)\"[^\"]*\"/\1\"${TARGET_VERSION}\"/" app/build.gradle.kts
             echo "Updated app/build.gradle.kts versionName from $CURRENT_VERSION to $TARGET_VERSION"
 
@@ -184,7 +197,7 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add app/build.gradle.kts
             git commit -m "chore: align app versionName with release tag ${{ steps.meta.outputs.tag }} [skip ci]"
-            git push origin "HEAD:${{ steps.source_ref.outputs.push_ref }}"
+            git push origin "HEAD:${PUSH_REF}"
           else
             echo "app/build.gradle.kts already uses versionName=$TARGET_VERSION"
           fi
