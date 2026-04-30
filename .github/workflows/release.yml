@@ -1,4 +1,8 @@
-name: release APK variants
+name: Manual Release APK Variants
+
+run-name: >-
+  Manual release ${{ inputs.tag || inputs.version || 'from-versionName' }}
+  from ${{ inputs.target_ref || github.ref_name }}
 
 on:
   workflow_dispatch:
@@ -45,9 +49,14 @@ on:
         required: false
         type: boolean
         default: true
+      target_ref:
+        description: "Branch, tag, or SHA to release from (leave blank to use the triggering ref)."
+        required: false
+        default: ""
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Scope concurrency by workflow + selected ref so manual runs do not collide unexpectedly.
+  group: release-${{ github.repository }}-${{ github.workflow }}-${{ inputs.target_ref || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -57,13 +66,36 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
-      models: read
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.target_ref || github.ref_name }}
+
+      - name: Validate selected source ref
+        id: source_ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          REQUESTED_REF="${{ inputs.target_ref || github.ref_name }}"
+          push_ref=""
+          if git show-ref --verify --quiet "refs/remotes/origin/${REQUESTED_REF}"; then
+            # Remote branch — version-bump commits can be pushed back.
+            push_ref="$REQUESTED_REF"
+          elif git show-ref --verify --quiet "refs/tags/${REQUESTED_REF}"; then
+            echo "Note: target_ref is a tag; version-bump commits will not be pushed back."
+          elif git rev-parse --verify --quiet "${REQUESTED_REF}^{commit}" > /dev/null 2>&1; then
+            echo "Note: target_ref resolved as a commit SHA; version-bump commits will not be pushed back."
+          else
+            echo "::error::Could not resolve target_ref '${REQUESTED_REF}' as a branch, tag, or SHA."
+            exit 1
+          fi
+          echo "push_ref=${push_ref}" >> "$GITHUB_OUTPUT"
+          RESOLVED_SHA="$(git rev-parse HEAD)"
+          echo "Manual release source ref: $REQUESTED_REF"
+          echo "Manual release source SHA: $RESOLVED_SHA"
 
       - name: Resolve release metadata
         id: meta
@@ -142,6 +174,8 @@ jobs:
       - name: Apply resolved release version to codebase
         id: sync_version
         shell: bash
+        env:
+          PUSH_REF: ${{ steps.source_ref.outputs.push_ref }}
         run: |
           set -euo pipefail
 
@@ -152,6 +186,10 @@ jobs:
           [ -n "$CURRENT_VERSION" ] || { echo "::error::Could not parse current versionName from app/build.gradle.kts"; exit 1; }
 
           if [ "$CURRENT_VERSION" != "$TARGET_VERSION" ]; then
+            if [ -z "$PUSH_REF" ]; then
+              echo "::error::Version bump required (${CURRENT_VERSION} → ${TARGET_VERSION}) but target_ref is a tag or SHA; cannot push the update. Use a branch as target_ref or ensure versionName already matches the resolved release version."
+              exit 1
+            fi
             sed -i "s/^\([[:space:]]*versionName[[:space:]]*=[[:space:]]*\)\"[^\"]*\"/\1\"${TARGET_VERSION}\"/" app/build.gradle.kts
             echo "Updated app/build.gradle.kts versionName from $CURRENT_VERSION to $TARGET_VERSION"
 
@@ -159,7 +197,7 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add app/build.gradle.kts
             git commit -m "chore: align app versionName with release tag ${{ steps.meta.outputs.tag }} [skip ci]"
-            git push origin "HEAD:${{ github.ref_name }}"
+            git push origin "HEAD:${PUSH_REF}"
           else
             echo "app/build.gradle.kts already uses versionName=$TARGET_VERSION"
           fi
@@ -261,38 +299,38 @@ jobs:
             local mode="$1"
             local output_name="$2"
             python - "$mode" "$INIT_FILE" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-mode = sys.argv[1]
-path = Path(sys.argv[2])
-source = path.read_text()
-
-source = re.sub(
-    r'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode\.[A-Z_]+;',
-    f'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode.{mode};',
-    source,
-    count=1,
-)
-
-# Primary release must keep all silent-mode features enabled.
-if mode == "SAFE_GLOBAL_ENABLE":
-    source = re.sub(
-        r'private static final boolean ENABLE_PROMPT_TTS_HOOKS = (true|false);',
-        'private static final boolean ENABLE_PROMPT_TTS_HOOKS = true;',
-        source,
-        count=1,
-    )
-    source = re.sub(
-        r'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = (true|false);',
-        'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = true;',
-        source,
-        count=1,
-    )
-
-path.write_text(source)
-PY
+          import re
+          import sys
+          from pathlib import Path
+          
+          mode = sys.argv[1]
+          path = Path(sys.argv[2])
+          source = path.read_text()
+          
+          source = re.sub(
+              r'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode\.[A-Z_]+;',
+              f'private static final RecordingCompatibilityMode MODE = RecordingCompatibilityMode.{mode};',
+              source,
+              count=1,
+          )
+          
+          # Primary release must keep all silent-mode features enabled.
+          if mode == "SAFE_GLOBAL_ENABLE":
+              source = re.sub(
+                  r'private static final boolean ENABLE_PROMPT_TTS_HOOKS = (true|false);',
+                  'private static final boolean ENABLE_PROMPT_TTS_HOOKS = true;',
+                  source,
+                  count=1,
+              )
+              source = re.sub(
+                  r'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = (true|false);',
+                  'private static final boolean ENABLE_SILENT_PROMPT_FALLBACK = true;',
+                  source,
+                  count=1,
+              )
+          
+          path.write_text(source)
+          PY
 
             ./gradlew --no-daemon assembleRelease
             APK_PATH="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' | sort | head -n 1)"
