@@ -34,7 +34,7 @@ For technical validation steps, see [`scripts/verify_silent_mode.sh`](./scripts/
 
 ## Requirements
 1. Android device with root and an active Xposed-compatible framework (for example, Vector/LSPosed-compatible environments).
-2. Google Dialer package: `com.google.android.dialer`.
+2. Google Dialer package: `com.google.android.dialer` installed as a system application (in /system/app or /system/priv-app). Otherwise, an error "missing capture_audio_output permission" will occur. If Google Dialer was installed from Google Play as a user app, you can use, for example, Lucky Patcher to convert it to a system app.
 3. Module scope set to **only** `com.google.android.dialer`.
 
 ## Install and setup
